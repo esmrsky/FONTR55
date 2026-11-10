@@ -80,12 +80,12 @@ export function computeMetrics(rawParams = {}) {
   const wNorm = (effectiveWeight - 100) / 900; // 0..1
 
   // Width scale (84% in screenshot is compact display; 100% is normal)
-  const widthScale = clamp(p.width / 100, 0.5, 1.45) * (1 + opszFactor * 0.04);
+  const widthScale = clamp(p.width / 100, 0.48, 1.45) * (1 + opszFactor * 0.04);
 
-  // Base vertical stem thickness V (from 26 at Thin 100 to 212 at Black 1000)
+  // Base vertical stem thickness V (from 26 at Thin 100 to 214 at Black 1000)
   const rawV = lerp(26, 214, Math.pow(clamp(wNorm, 0, 1.05), 0.92));
-  // Scale stem slightly with widthScale so ultra-condensed black still preserves counters
-  const V = rawV * clamp(0.76 + 0.26 * widthScale, 0.72, 1.08);
+  // Scale stem smoothly with widthScale so ultra-condensed black (e.g. Neue Lifter) preserves crisp counters
+  const V = rawV * clamp(0.62 + 0.38 * widthScale, 0.56, 1.08);
 
   // Elegance / Stroke Contrast & Calligraphic Stress Axis (-25° to +30°)
   const eleg = clamp(p.elegance / 100, 0, 1);
@@ -96,12 +96,12 @@ export function computeMetrics(rawParams = {}) {
   // Tilting the Contrast Axis automatically activates calligraphic contrast even when Elegance is at 0%
   const effEleg = clamp(Math.max(eleg, stressMag * 0.52), 0, 1);
 
-  const baseHRatio = lerp(0.85, 0.21, Math.pow(effEleg, 0.88));
-  const H = Math.max(14, V * baseHRatio);
+  const baseHRatio = lerp(0.85, 0.15, Math.pow(effEleg, 0.85));
+  const H = Math.max(13, V * baseHRatio);
 
   // Diagonal primary (\) and secondary (/) stroke thicknesses respond to both Elegance and Contrast Axis sign
-  const thickDiag = V * lerp(0.97, 1.05, effEleg);
-  const thinDiag = Math.max(15, V * lerp(0.92, 0.26, Math.pow(effEleg, 0.85)));
+  const thickDiag = V * lerp(0.97, 1.06, effEleg);
+  const thinDiag = Math.max(14, V * lerp(0.92, 0.20, Math.pow(effEleg, 0.84)));
   const D1 =
     stressBias >= 0
       ? lerp(thickDiag, thickDiag * 1.04, stressBias)
@@ -134,7 +134,7 @@ export function computeMetrics(rawParams = {}) {
   // Flare & Roundness
   const flare = clamp(p.flare / 100, 0, 1);
   const roundness = clamp(p.roundness / 100, 0, 1);
-  const crossbarShift = clamp(p.crossbar / 100, -0.35, 0.35);
+  const crossbarShift = clamp(p.crossbar / 100, -0.45, 0.45);
   const slantTan = Math.tan((clamp(p.slant, -18, 18) * Math.PI) / 180);
 
   return {
@@ -496,15 +496,17 @@ export class PathCompiler {
       const dy = ty - sy;
       const len = Math.hypot(dx, dy);
       if (len > 80) {
-        // Concave waisting along long stems for Optima-like glyphic elegance
-        const nx = (-dy / len) * flareDir * m.flare * Math.min(m.V * 0.14, 14);
-        const ny = (dx / len) * flareDir * m.flare * Math.min(m.V * 0.14, 14);
+        // Concave inward waisting along long stems for Balchér / Optima glyphic flare
+        // In +Y-up CW contours, the inward normal pointing into the stem is (dy/len, -dx/len)
+        const flareAmt = m.flare * Math.min(m.V * 0.22, 24);
+        const nx = (dy / len) * flareDir * flareAmt;
+        const ny = (-dx / len) * flareDir * flareAmt;
         cmds.push({
           cmd: 'C',
-          c1x: lerp(sx, tx, 0.33) + nx,
-          c1y: lerp(sy, ty, 0.33) + ny,
-          c2x: lerp(sx, tx, 0.67) + nx,
-          c2y: lerp(sy, ty, 0.67) + ny,
+          c1x: lerp(sx, tx, 0.28) + nx,
+          c1y: lerp(sy, ty, 0.28) + ny,
+          c2x: lerp(sx, tx, 0.72) + nx,
+          c2y: lerp(sy, ty, 0.72) + ny,
           x: tx,
           y: ty,
         });
@@ -1013,9 +1015,91 @@ function addSContour(pc, m, { xL, xR, topY, botY, vStroke, hStroke }) {
 }
 
 /**
- * Unified Stem + Bowl Builder for b, d, p, q (and g upper bowl)
+ * Solve for parameter t in [0, 1] where a normalized superellipse quadrant
+ * P0=(0,1), P1=(k,1), P2=(1,k), P3=(1,0) reaches horizontal fraction x(t) = uTarget.
+ */
+function solveSuperellipseTForX(uTarget, k) {
+  const u = clamp(uTarget, 0, 1);
+  if (u <= 0) return 0;
+  if (u >= 1) return 1;
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < 18; i++) {
+    const mid = (lo + hi) * 0.5;
+    const mt = 1 - mid;
+    const x = 3 * mt * mt * mid * k + 3 * mt * mid * mid + mid * mid * mid;
+    if (x < u) lo = mid;
+    else hi = mid;
+  }
+  return (lo + hi) * 0.5;
+}
+
+/**
+ * Exact de Casteljau subdivision of an outer superellipse quadrant at targetX (e.g. inner stem wall xL + V).
+ * Guarantees uniform stroke thickness between outer bowl/arch and inner counter across all weights (100–1000).
+ */
+function splitSuperellipseQuadrantAtX(cx, cy, rx, ry, dirX, dirY, targetX, k, extraNotchY = 0) {
+  const dx = Math.abs(targetX - cx);
+  const u = clamp(dx / Math.max(1, rx), 0.02, 1);
+  const t = solveSuperellipseTForX(u, k);
+
+  const p0x = cx;
+  const p0y = cy + dirY * ry;
+  const p1x = cx + dirX * rx * k;
+  const p1y = cy + dirY * ry;
+  const p2x = cx + dirX * rx;
+  const p2y = cy + dirY * ry * k;
+  const p3x = cx + dirX * rx;
+  const p3y = cy;
+
+  const q0x = lerp(p0x, p1x, t);
+  const q0y = lerp(p0y, p1y, t);
+  const q1x = lerp(p1x, p2x, t);
+  const q1y = lerp(p1y, p2y, t);
+  const q2x = lerp(p2x, p3x, t);
+  const q2y = lerp(p2y, p3y, t);
+
+  const r0x = lerp(q0x, q1x, t);
+  const r0y = lerp(q0y, q1y, t);
+  const r1x = lerp(q1x, q2x, t);
+  const r1y = lerp(q1y, q2y, t);
+
+  const sx = targetX;
+  const sy = lerp(r0y, r1y, t) - dirY * extraNotchY;
+  const r0yAdj = r0y - dirY * extraNotchY * 0.45;
+
+  const crownToStem = {
+    type: 'cubic',
+    c1x: q0x,
+    c1y: q0y,
+    c2x: r0x,
+    c2y: r0yAdj,
+    x: sx,
+    y: sy,
+  };
+  const stemToCrown = {
+    type: 'cubic',
+    c1x: r0x,
+    c1y: r0yAdj,
+    c2x: q0x,
+    c2y: q0y,
+    x: p0x,
+    y: p0y,
+  };
+  return {
+    joinX: sx,
+    joinY: sy,
+    crownToStem,
+    stemToCrown,
+    fromCrownToTarget: crownToStem,
+    fromTargetToCrown: stemToCrown,
+  };
+}
+
+/**
+ * Unified Stem + Bowl Builder for b, d, p, q (and single-story a)
  * Supports seamless Spurless (0%..100%), Surgical Ink Traps at shoulder & base notches,
- * High-Contrast Elegance, and Superellipse Bowl Squaring!
+ * High-Contrast Elegance, and Superellipse Bowl Squaring across Weight 100–1000!
  */
 function buildStemAndBowl(pc, m, mode) {
   // mode: 'b' | 'd' | 'p' | 'q'
@@ -1043,26 +1127,29 @@ function buildStemAndBowl(pc, m, mode) {
 
   const stemTop = isAscender ? m.asc : m.xh - m.desc;
   const bowlCenterX = lerp(cx + V * 0.05, cx, sp);
+  const bowlRxLeft = bowlCenterX - xL;
   const bowlRxRight = xR - bowlCenterX;
   const bowlRy = (topY - botY) * 0.5;
 
-  // Trap width at the stem-bowl notch
+  // Trap width & depth at the stem-bowl notch
   const notchSpread = m.inkTraps > 0.01 ? V * 0.14 * m.inkTraps * m.trapWidth : 0;
   const topTouchX = xL + V + notchSpread * 0.5;
-  const topStemSpan = Math.max(14, bowlCenterX - topTouchX);
+  const trapExtraNotch = m.xh * 0.14 * m.inkTraps * m.trapDepth;
 
-  // Cap notch depth relative to topStemSpan so heavy weights never pinch or slice the stem-side bowl
-  const baseNotchDepth = lerp(Math.min(m.xh * 0.075, V * 0.24), Math.min(m.xh * 0.02, V * 0.06), sp);
-  const trapNotchDepth = m.xh * 0.22 * m.inkTraps * m.trapDepth;
-  const nonSpurNotch = Math.min(baseNotchDepth + trapNotchDepth, topStemSpan * 0.36);
-  const topNotchY = topY - nonSpurNotch;
-  const nonSpurCrownX = lerp(topTouchX + topStemSpan * 0.55, bowlCenterX, 0.35);
-  const nonSpurRxRight = xR - nonSpurCrownX;
-  const nonSpurStemSpan = Math.max(10, nonSpurCrownX - topTouchX);
+  // Exact de Casteljau sub-arc where the outer superellipse intersects the inner stem wall x = topTouchX
+  const topJoin = splitSuperellipseQuadrantAtX(
+    bowlCenterX,
+    midY,
+    bowlRxLeft,
+    bowlRy,
+    -1,
+    1,
+    topTouchX,
+    kOut,
+    trapExtraNotch
+  );
+  const topNotchY = topJoin.joinY;
 
-  // Two-stage continuous Spurless transition:
-  // Stage 1 (sp 0..0.4): spur notch at baseline fills in smoothly without lifting the foot up the stem
-  // Stage 2 (sp 0.4..1.0): pure unbroken superellipse sweep from bottom crown into outer stem wall
   const spCurveT = clamp((sp - 0.35) / 0.65, 0, 1);
   const leftBotCornerY = sp < 0.35 ? 0 : midY;
 
@@ -1073,7 +1160,7 @@ function buildStemAndBowl(pc, m, mode) {
     { type: 'pt', x: xL, y: stemTop, r: 1 },
     // Left stem top-right
     { type: 'pt', x: xL + V, y: stemTop, r: 1 },
-    // Down to upper shoulder notch
+    // Down inner stem wall to upper shoulder intersection
     { type: 'pt', x: xL + V, y: topNotchY + notchSpread, r: 0.2 },
     ...(m.inkTraps > 0.02
       ? [
@@ -1086,20 +1173,12 @@ function buildStemAndBowl(pc, m, mode) {
         ]
       : []),
     { type: 'pt', x: topTouchX, y: topNotchY, r: 0.15 },
-    // Curve up to non-spur bowl crown (nonSpurCrownX, topY)
-    {
-      type: 'cubic',
-      c1x: topTouchX + nonSpurStemSpan * 0.22,
-      c1y: lerp(topNotchY, topY, 0.80),
-      c2x: nonSpurCrownX - nonSpurStemSpan * kOut,
-      c2y: topY,
-      x: nonSpurCrownX,
-      y: topY,
-    },
+    // Exact de Casteljau sub-arc up to top bowl crown (bowlCenterX, topY)
+    topJoin.stemToCrown,
     // Top crown -> Right cheek (xR, midY)
     {
       type: 'cubic',
-      c1x: nonSpurCrownX + nonSpurRxRight * kOut,
+      c1x: bowlCenterX + bowlRxRight * kOut,
       c1y: topY,
       c2x: xR,
       c2y: midY + bowlRy * kOut,
@@ -1119,31 +1198,28 @@ function buildStemAndBowl(pc, m, mode) {
   ];
 
   if (sp < 0.35) {
-    // Classic spurred grotesque (sp 0..0.35): spur foot stays at baseline y=0 while notch shallows
+    // Classic spurred grotesque (sp 0..0.35): exact de Casteljau sub-arc into inner stem wall
     const spLocal = sp / 0.35;
-    const botNotch = Math.min(baseNotchDepth + trapNotchDepth, topStemSpan * 0.38) * (1 - spLocal * 0.75);
-    const botNotchY = botY + botNotch;
-    const botTouchX = xL + V + notchSpread * 0.5 * (1 - spLocal);
-    const botCrownX = lerp(botTouchX + topStemSpan * 0.55, bowlCenterX, 0.35);
-    const botSpan = Math.max(10, botCrownX - botTouchX);
-    outerB[outerB.length - 1].x = botCrownX;
-    outerB[outerB.length - 1].c2x = botCrownX + (xR - botCrownX) * kOut;
+    const botTouchX = lerp(xL + V + notchSpread * 0.5, xL, spLocal * 0.65);
+    const botJoin = splitSuperellipseQuadrantAtX(
+      bowlCenterX,
+      midY,
+      bowlRxLeft,
+      bowlRy,
+      -1,
+      -1,
+      botTouchX,
+      kOut,
+      trapExtraNotch * (1 - spLocal)
+    );
     outerB.push(
-      {
-        type: 'cubic',
-        c1x: botCrownX - botSpan * kOut,
-        c1y: botY,
-        c2x: botTouchX + botSpan * 0.22,
-        c2y: lerp(botNotchY, botY, 0.80),
-        x: botTouchX,
-        y: botNotchY,
-      },
+      botJoin.crownToStem,
       ...(m.inkTraps > 0.02
         ? [
             {
               type: 'pt',
               x: xL + V - Math.min(V * 0.35, V * 0.28 * m.inkTraps * m.trapDepth * (1 - spLocal)),
-              y: botNotchY + V * 0.12 * m.inkTraps * m.trapDepth * (1 - spLocal),
+              y: botJoin.joinY + V * 0.12 * m.inkTraps * m.trapDepth * (1 - spLocal),
               r: 0,
             },
           ]
@@ -1318,18 +1394,16 @@ function buildArchGlyph(pc, m, mode) {
     const cHalfW = Math.max(16, (c1R - c1L) * 0.5);
 
     // Proportional semicircular inner arch radius so inner counter is never a tall pinched gothic slot!
-    const inArchRy = clamp(cHalfW * lerp(1.22, 0.92, m.shoulder), m.xh * 0.14, inArchTop - m.xh * 0.42);
+    const inArchRy = clamp(cHalfW * lerp(1.18, 0.90, m.shoulder), m.xh * 0.14, inArchTop - m.xh * 0.42);
     const inTurnY = inArchTop - inArchRy;
-    const outTurnY = Math.max(m.xh * 0.48, inTurnY - H * 0.08);
+    const outTurnY = Math.max(m.xh * 0.44, inTurnY - H * 0.08);
+    const outArchRy = topY - outTurnY;
 
     // Center Arch 1 and Arch 2 crowns over Counter 1 and Counter 2
-    const arch1Cx = lerp(c1Mid + V * 0.08, c1Mid, sp);
-    const arch2Cx = lerp(c2Mid + V * 0.08, c2Mid, sp);
-    const valleyX = lerp(midStemL + V * 0.42, midStemCx, sp);
-
-    const notchBase = lerp(Math.min(m.xh * 0.14, V * 0.46), m.xh * 0.25, m.inkTraps * m.trapDepth);
-    const valleyDrop = lerp(notchBase, Math.min(m.xh * 0.19, (topY - outTurnY) * 0.56), sp);
-    const valleyY = topY - valleyDrop;
+    const arch1Cx = lerp(c1Mid + V * 0.06, c1Mid, sp);
+    const arch2Cx = lerp(c2Mid + V * 0.06, c2Mid, sp);
+    const valleyX = lerp(midStemL + V * 0.46, midStemCx, sp);
+    const trapExtra = m.xh * 0.14 * m.inkTraps * m.trapDepth;
 
     // Calligraphic stress shift for inner arches of 'm'
     const stressDx = sBias * Math.min(cHalfW * 0.40, V * 0.34);
@@ -1345,30 +1419,32 @@ function buildArchGlyph(pc, m, mode) {
 
     if (sp < 0.35) {
       const spLocal = sp / 0.35;
-      const notch1 = notchBase * (1 - spLocal * 0.75);
-      const leftSpan = Math.max(10, arch1Cx - (xL + V));
+      const touchX1 = lerp(xL + V, xL, spLocal * 0.65);
+      const leftJoin = splitSuperellipseQuadrantAtX(
+        arch1Cx,
+        outTurnY,
+        arch1Cx - xL,
+        outArchRy,
+        -1,
+        1,
+        touchX1,
+        kOut,
+        trapExtra * (1 - spLocal)
+      );
       nodes.push(
         { type: 'pt', x: xL + V, y: m.xh, r: 0.9 * (1 - spLocal) },
-        { type: 'pt', x: xL + V, y: topY - notch1, r: 0.15 },
+        { type: 'pt', x: xL + V, y: leftJoin.joinY, r: 0.15 },
         ...(m.inkTraps > 0.02
           ? [
               {
                 type: 'pt',
                 x: xL + V - V * 0.25 * m.inkTraps * m.trapDepth * (1 - spLocal),
-                y: topY - notch1 - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                y: leftJoin.joinY - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
                 r: 0,
               },
             ]
           : []),
-        {
-          type: 'cubic',
-          c1x: xL + V + leftSpan * 0.22,
-          c1y: lerp(topY - notch1, topY, 0.76),
-          c2x: arch1Cx - leftSpan * kOut,
-          c2y: topY,
-          x: arch1Cx,
-          y: topY,
-        }
+        leftJoin.stemToCrown
       );
     } else {
       const kSpurX = lerp(0.76, kOut, spCurveT);
@@ -1384,19 +1460,35 @@ function buildArchGlyph(pc, m, mode) {
       });
     }
 
-    // Arch 1 down into symmetric middle valley (valleyX, valleyY)
-    const valleySpan1 = Math.max(10, valleyX - arch1Cx);
-    const valleySpan2 = Math.max(10, arch2Cx - valleyX);
+    // Arch 1 down into middle valley (valleyX) and up Arch 2 via exact de Casteljau subdivision
+    const vJoin1 = splitSuperellipseQuadrantAtX(
+      arch1Cx,
+      outTurnY,
+      midStemR - arch1Cx,
+      outArchRy,
+      1,
+      1,
+      valleyX,
+      kOut,
+      trapExtra
+    );
+    const vJoin2 = splitSuperellipseQuadrantAtX(
+      arch2Cx,
+      outTurnY,
+      arch2Cx - midStemL,
+      outArchRy,
+      -1,
+      1,
+      valleyX,
+      kOut,
+      trapExtra
+    );
+    const valleyY = Math.min(vJoin1.joinY, vJoin2.joinY);
+    vJoin1.crownToStem.y = valleyY;
+    vJoin2.stemToCrown.c1y = lerp(valleyY, topY, 0.55);
+
     nodes.push(
-      {
-        type: 'cubic',
-        c1x: arch1Cx + valleySpan1 * kOut,
-        c1y: topY,
-        c2x: valleyX,
-        c2y: lerp(valleyY, topY, 0.68),
-        x: valleyX,
-        y: valleyY,
-      },
+      vJoin1.crownToStem,
       ...(m.inkTraps > 0.02
         ? [
             {
@@ -1407,16 +1499,7 @@ function buildArchGlyph(pc, m, mode) {
             },
           ]
         : []),
-      // Up Arch 2 to arch2Cx
-      {
-        type: 'cubic',
-        c1x: valleyX + valleySpan2 * 0.22,
-        c1y: lerp(valleyY, topY, 0.74),
-        c2x: arch2Cx - valleySpan2 * kOut,
-        c2y: topY,
-        x: arch2Cx,
-        y: topY,
-      },
+      vJoin2.stemToCrown,
       // Arch 2 down to outer right wall at outTurnY
       {
         type: 'cubic',
@@ -1493,7 +1576,8 @@ function buildArchGlyph(pc, m, mode) {
 
     const turnY = m.xh * lerp(0.54, 0.62, m.shoulder * (1 - sp * 0.3));
     const inTurnY = Math.min(turnY, topY - H - 18);
-    const notchBase = lerp(Math.min(m.xh * 0.16, V * 0.52), m.xh * 0.28, m.inkTraps * m.trapDepth);
+    const outArchRy = topY - inTurnY;
+    const trapExtra = m.xh * 0.14 * m.inkTraps * m.trapDepth;
 
     const armCrownX = xL + V + (xR - (xL + V)) * 0.62;
     const inCrownX = armCrownX + sBias * Math.min((xR - (xL + V)) * 0.18, V * 0.30);
@@ -1509,30 +1593,32 @@ function buildArchGlyph(pc, m, mode) {
 
     if (sp < 0.35) {
       const spLocal = sp / 0.35;
-      const notch = notchBase * (1 - spLocal * 0.75);
-      const leftSpan = Math.max(10, armCrownX - (xL + V));
+      const touchX = lerp(xL + V, xL, spLocal * 0.65);
+      const rJoin = splitSuperellipseQuadrantAtX(
+        armCrownX,
+        inTurnY,
+        armCrownX - xL,
+        outArchRy,
+        -1,
+        1,
+        touchX,
+        kOut,
+        trapExtra * (1 - spLocal)
+      );
       nodes.push(
         { type: 'pt', x: xL + V, y: m.xh, r: 0.9 * (1 - spLocal) },
-        { type: 'pt', x: xL + V, y: topY - notch, r: 0.15 },
+        { type: 'pt', x: xL + V, y: rJoin.joinY, r: 0.15 },
         ...(m.inkTraps > 0.02
           ? [
               {
                 type: 'pt',
                 x: xL + V - V * 0.26 * m.inkTraps * m.trapDepth * (1 - spLocal),
-                y: topY - notch - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                y: rJoin.joinY - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
                 r: 0,
               },
             ]
           : []),
-        {
-          type: 'cubic',
-          c1x: xL + V + leftSpan * 0.24,
-          c1y: lerp(topY - notch, topY, 0.78),
-          c2x: armCrownX - leftSpan * kOut,
-          c2y: topY,
-          x: armCrownX,
-          y: topY,
-        }
+        rJoin.stemToCrown
       );
     } else {
       const kSpurX = lerp(0.76, kOut, spCurveT);
@@ -1609,11 +1695,12 @@ function buildArchGlyph(pc, m, mode) {
   const inHalfW = Math.max(18, (xR - V - (xL + V)) * 0.5);
 
   // Proportional semicircular inner arch radius so inner counter is circular and never swells at 10/2 o'clock!
-  const inArchRy = clamp(inHalfW * lerp(1.25, 0.94, m.shoulder), m.xh * 0.16, inTop - m.xh * 0.42);
+  const inArchRy = clamp(inHalfW * lerp(1.18, 0.90, m.shoulder), m.xh * 0.16, inTop - m.xh * 0.42);
   const inTurnY = inTop - inArchRy;
-  const outTurnY = Math.max(m.xh * 0.48, inTurnY - H * 0.08);
+  const outTurnY = Math.max(m.xh * 0.44, inTurnY - H * 0.08);
+  const outArchRy = topY - outTurnY;
+  const trapExtra = m.xh * 0.14 * m.inkTraps * m.trapDepth;
 
-  const notchBase = lerp(Math.min(m.xh * 0.15, V * 0.48), m.xh * 0.26, m.inkTraps * m.trapDepth);
   const archCx = lerp(cx + V * 0.05, cx, isH ? 0 : sp);
 
   // Calligraphic stress shift for inner arch
@@ -1630,30 +1717,32 @@ function buildArchGlyph(pc, m, mode) {
 
   if (isH || sp < 0.35) {
     const spLocal = isH ? 0 : sp / 0.35;
-    const notch = notchBase * (1 - spLocal * 0.75);
-    const leftSpan = Math.max(12, archCx - (xL + V));
+    const touchX = lerp(xL + V, xL, spLocal * 0.65);
+    const nJoin = splitSuperellipseQuadrantAtX(
+      archCx,
+      outTurnY,
+      archCx - xL,
+      outArchRy,
+      -1,
+      1,
+      touchX,
+      kOut,
+      trapExtra * (1 - spLocal)
+    );
     nNodes.push(
       { type: 'pt', x: xL + V, y: isH ? m.asc : m.xh, r: isH ? 1 : 0.9 * (1 - spLocal) },
-      { type: 'pt', x: xL + V, y: topY - notch, r: 0.15 },
+      { type: 'pt', x: xL + V, y: nJoin.joinY, r: 0.15 },
       ...(m.inkTraps > 0.02
         ? [
             {
               type: 'pt',
               x: xL + V - V * 0.26 * m.inkTraps * m.trapDepth * (1 - spLocal),
-              y: topY - notch - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
+              y: nJoin.joinY - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
               r: 0,
             },
           ]
         : []),
-      {
-        type: 'cubic',
-        c1x: xL + V + leftSpan * 0.22,
-        c1y: lerp(topY - notch, topY, 0.76),
-        c2x: archCx - leftSpan * kOut,
-        c2y: topY,
-        x: archCx,
-        y: topY,
-      }
+      nJoin.stemToCrown
     );
   } else {
     // Continuous Spurless 'n' / 'u': outer wall sweeps seamlessly over arch (concentric with 'o')
@@ -1745,13 +1834,13 @@ const GLYPH_BUILDERS = {
     const leftW = Math.min(m.D2 * 0.88, w * 0.285);
     const barH = Math.min(m.H * 0.86, cap * 0.205);
 
-    const apexHalfW = Math.min(w * 0.23, Math.max((leftW + rightW) * 0.36, w * 0.125));
+    const apexHalfW = clamp((leftW + rightW) * 0.56, m.V * 0.56, w * 0.23);
     const topL = cx - apexHalfW;
     const topR = cx + apexHalfW;
 
-    const barBotY = clamp(cap * (0.23 + m.crossbarShift * 0.24), cap * 0.11, cap * 0.43);
-    const barTopY = Math.min(cap * 0.58, barBotY + barH);
-    const apexInnerY = Math.max(barTopY + 95, cap - Math.max(leftW, rightW) * 0.88);
+    const barBotY = clamp(cap * (0.25 + m.crossbarShift * 0.28), cap * 0.08, cap * 0.52);
+    const barTopY = Math.min(cap * 0.64, barBotY + barH);
+    const apexInnerY = clamp(cap - Math.max(leftW, rightW) * 0.92, barTopY + 48, cap - barH * 0.75);
     const apexCx = cx - (leftW - rightW) * 0.16;
 
     // Collinear inner leg X at any height y from 0 up to apexInnerY
@@ -2141,29 +2230,34 @@ const GLYPH_BUILDERS = {
       extraNodesBottomRight(nodes, info) {
         const { ix, iy, kxOut, kyOut, kxIn, kyIn, inTopX, inTopY, topFrac, topA } = info;
         const xR = cx + rx;
-        const notchDepth = lerp(m.cap * 0.12, m.cap * 0.22, m.inkTraps * m.trapDepth) * (1 - sp);
+        const trapExtra = m.cap * 0.12 * m.inkTraps * m.trapDepth;
+        let inTurnY = barBotY;
 
         if (sp < 0.35) {
-          // Grotesque G with bottom-right spur (sp 0..0.35)
+          // Grotesque G with bottom-right spur (sp 0..0.35) using exact de Casteljau subdivision
           const spLocal = sp / 0.35;
-          const spurL = xR - V * 0.88;
-          const notchY = -m.ov + notchDepth * (1 - spLocal * 0.75);
+          const spurL = xR - V * 0.92;
+          const touchX = lerp(spurL, xR, spLocal * 0.65);
+          const gJoin = splitSuperellipseQuadrantAtX(
+            cx,
+            cy,
+            rx,
+            ry,
+            1,
+            -1,
+            touchX,
+            m.kappaOut,
+            trapExtra * (1 - spLocal)
+          );
+          inTurnY = Math.min(cy, barBotY);
           nodes.push(
-            {
-              type: 'cubic',
-              c1x: cx + kxOut * 0.65,
-              c1y: cy - ry,
-              c2x: spurL - rx * 0.1,
-              c2y: notchY * 0.35,
-              x: spurL,
-              y: notchY,
-            },
+            gJoin.crownToStem,
             ...(m.inkTraps > 0.02
               ? [
                   {
                     type: 'pt',
                     x: spurL + V * 0.22 * m.inkTraps * m.trapDepth * (1 - spLocal),
-                    y: notchY + V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                    y: gJoin.joinY + V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
                     r: 0,
                   },
                 ]
@@ -2198,6 +2292,9 @@ const GLYPH_BUILDERS = {
             trap: { d: 0.7, w: 0.65, bx: 0.7, by: 0.7 },
           }
         );
+        if (inTurnY < barBotY - 2) {
+          nodes.push({ type: 'pt', x: cx + ix, y: inTurnY, r: 0 });
+        }
 
         const innerG = pc.applyCounterStress(
           [
@@ -2205,7 +2302,7 @@ const GLYPH_BUILDERS = {
             {
               type: 'cubic',
               c1x: cx + ix,
-              c1y: lerp(barBotY, cy - iy, 0.58),
+              c1y: lerp(inTurnY, cy - iy, m.kappaIn),
               c2x: cx + kxIn,
               c2y: cy - iy,
               x: cx,
@@ -2375,9 +2472,9 @@ const GLYPH_BUILDERS = {
     const loLegW = Math.min(m.D1 * 1.08, w * 0.38);
 
     const midY = clamp(cap * (0.48 + m.crossbarShift * 0.16), cap * 0.28, cap * 0.68);
-    const crotchX = xL + V + (xR - (xL + V)) * 0.25;
-    const stemJoinTopY = Math.min(cap * 0.78, midY + upArmW * 0.48);
-    const stemJoinBotY = Math.max(cap * 0.18, midY - upArmW * 0.48);
+    const crotchX = xL + V + clamp(Math.max(upArmW, loLegW) * 1.12, 18, (xR - (xL + V)) * 0.36);
+    const stemJoinTopY = Math.min(cap * 0.78, midY + upArmW * 0.52);
+    const stemJoinBotY = Math.max(cap * 0.18, midY - upArmW * 0.52);
 
     pc.addPolygon([
       [xL, 0, { r: 1 }],
@@ -2425,15 +2522,15 @@ const GLYPH_BUILDERS = {
     const cx = (xL + xR) * 0.5;
     const cap = m.cap;
 
-    // 4 strokes in M: apply optical density control so Weight 1000 stays crisp
+    // 4 strokes in M: scale shoulders and vertex strictly with stroke weight V/D1/D2 across 100–1000
     const V = Math.min(m.V * 0.86, w * 0.24);
     const dLeft = Math.min(m.D1 * 0.84, w * 0.23);
     const dRight = Math.min(m.D2 * 0.84, w * 0.23);
 
-    const shoulderW = Math.max(V * 1.38, w * 0.24);
-    const vBotHalfW = Math.max((dLeft + dRight) * 0.42, w * 0.08);
-    const vTopY = Math.max(cap * 0.28, (dLeft + dRight) * 1.05);
-    const innerDropY = Math.min(cap * 0.68, cap - V * 0.95);
+    const shoulderW = clamp(V + dLeft * 0.94, V * 1.45, w * 0.28);
+    const vBotHalfW = clamp((dLeft + dRight) * 0.46, V * 0.45, w * 0.12);
+    const vTopY = clamp((dLeft + dRight) * 1.05, m.H * 1.1, cap * 0.44);
+    const innerDropY = clamp(cap - Math.max(dLeft, dRight) * 1.15, cap * 0.56, cap - m.H * 0.85);
 
     pc.addPolygon([
       [xL, 0, { r: 1 }],
@@ -2463,8 +2560,8 @@ const GLYPH_BUILDERS = {
 
     const vStem = Math.min(m.V * lerp(0.92, 0.56, m.eleg * 0.65), w * 0.33);
     const diagW = Math.min(m.D1 * 0.96, w * 0.34);
-    const shoulderW = Math.max(vStem + diagW * 0.58, w * 0.28);
-    const joinDrop = Math.min(cap * 0.64, cap - diagW * 1.05);
+    const shoulderW = clamp(vStem + diagW * 0.92, vStem * 1.45, w * 0.36);
+    const joinDrop = clamp(cap - diagW * 1.15, cap * 0.52, cap - m.H * 0.80);
 
     pc.addPolygon([
       [xL, 0, { r: 1 }],
@@ -2591,12 +2688,13 @@ const GLYPH_BUILDERS = {
     const H = Math.min(m.H, ry * 0.62);
     const kOut = m.kappaOut;
 
-    // Unified outer contour of O + bottom-right diagonal tail (like screenshot!)
+    // Unified outer contour of O + bottom-right diagonal tail proportional to stroke weight
     const tailW = Math.max(H * 0.95, V * 0.62);
     const tailTipX = cx + rx * 0.92;
     const tailTipY = -m.cap * 0.095;
-    const tailJoinAngle1 = 0.52; // ~30 deg below right extremum
-    const tailJoinAngle2 = 1.05; // ~60 deg below right extremum
+    const halfAng = clamp((tailW * 0.72) / Math.max(80, rx), 0.06, 0.28);
+    const tailJoinAngle1 = 0.78 - halfAng;
+    const tailJoinAngle2 = 0.78 + halfAng;
 
     const j1x = cx + rx * Math.cos(tailJoinAngle1);
     const j1y = cy - ry * Math.sin(tailJoinAngle1);
@@ -2888,8 +2986,8 @@ const GLYPH_BUILDERS = {
 
     const leftW = Math.min(m.D1 * 0.92, w * 0.305);
     const rightW = Math.min(m.D2 * 0.88, w * 0.295);
-    const botHalfW = Math.min(w * 0.22, Math.max((leftW + rightW) * 0.36, w * 0.125));
-    const innerApexY = Math.min(cap * 0.68, Math.max(leftW, rightW) * 0.95);
+    const botHalfW = clamp((leftW + rightW) * 0.54, m.V * 0.54, w * 0.22);
+    const innerApexY = clamp(Math.max(leftW, rightW) * 0.95, m.H * 0.9, cap * 0.68);
 
     pc.addPolygon([
       [cx - botHalfW, 0, { r: 1 }],
@@ -2916,11 +3014,11 @@ const GLYPH_BUILDERS = {
     const s2 = Math.min(m.D2 * 0.75, w * 0.185);
     const v1X = xL + w * 0.27;
     const v2X = xR - w * 0.27;
-    const botHalf = Math.min(w * 0.125, Math.max((s1 + s2) * 0.45, w * 0.085));
-    const midTopHalf = Math.min(w * 0.11, Math.max((s1 + s2) * 0.42, w * 0.075));
+    const botHalf = clamp((s1 + s2) * 0.54, m.V * 0.48, w * 0.125);
+    const midTopHalf = clamp((s1 + s2) * 0.50, m.V * 0.44, w * 0.11);
     const midTopY = cap * 0.96;
-    const innerBotY = Math.min(cap * 0.68, Math.max(s1, s2) * 1.18);
-    const innerMidY = Math.max(cap * 0.30, cap - Math.max(s1, s2) * 1.18);
+    const innerBotY = clamp(Math.max(s1, s2) * 1.18, m.H * 0.95, cap * 0.68);
+    const innerMidY = clamp(cap - Math.max(s1, s2) * 1.18, cap * 0.30, midTopY - m.H * 0.85);
 
     pc.addPolygon([
       [v1X - botHalf, 0, { r: 0.9 }],
@@ -2953,11 +3051,12 @@ const GLYPH_BUILDERS = {
     const d1 = Math.min(m.D1 * 0.94, w * 0.31);
     const d2 = Math.min(m.D2 * 0.90, w * 0.30);
     const dAvg = (d1 + d2) * 0.5;
-    // Exact collinear intersection geometry for two crossing diagonals
-    const waistHalfX = Math.max(dAvg * 0.52, w * 0.08);
-    const waistHalfY = Math.min(
-      cap * 0.26,
-      Math.max((cap * 0.5) * (dAvg / Math.max(dAvg * 1.4, w - dAvg)), cap * 0.08)
+    // Exact collinear intersection geometry for two crossing diagonals across all weights
+    const waistHalfX = clamp(dAvg * 0.60, m.V * 0.52, w * 0.22);
+    const waistHalfY = clamp(
+      (cap * 0.5) * (waistHalfX / Math.max(24, (w - dAvg) * 0.5)),
+      m.H * 0.52,
+      cap * 0.26
     );
 
     pc.addPolygon([
@@ -3105,29 +3204,33 @@ Object.assign(GLYPH_BUILDERS, {
 
     if (sp < 0.35) {
       const spLocal = sp / 0.35;
-      const notch = notchBase * (1 - spLocal * 0.75);
+      const touchX = lerp(xR - V, xR, spLocal * 0.72);
+      const trapExtra = xh * 0.18 * m.inkTraps * m.trapDepth * (1 - spLocal);
+      const botJoin = splitSuperellipseQuadrantAtX(
+        bellyBotX,
+        bellyMidY,
+        xR - bellyBotX,
+        bellyMidY - botY,
+        1,
+        -1,
+        touchX,
+        kOut,
+        trapExtra
+      );
       outer.push(
         { type: 'pt', x: xR - V, y: 0, r: 0.9 * (1 - spLocal) },
-        { type: 'pt', x: xR - V, y: botY + notch, r: 0.15 },
+        { type: 'pt', x: touchX, y: botJoin.joinY, r: 0.15 },
         ...(m.inkTraps > 0.02
           ? [
               {
                 type: 'pt',
-                x: xR - V + V * 0.25 * m.inkTraps * m.trapDepth * (1 - spLocal),
-                y: botY + notch + V * 0.12 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                x: touchX + V * 0.25 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                y: botJoin.joinY + V * 0.12 * m.inkTraps * m.trapDepth * (1 - spLocal),
                 r: 0,
               },
             ]
           : []),
-        {
-          type: 'cubic',
-          c1x: xR - V - rightSpan * 0.24,
-          c1y: lerp(botY + notch, botY, 0.76),
-          c2x: bellyBotX + rightSpan * kOut,
-          c2y: botY,
-          x: bellyBotX,
-          y: botY,
-        }
+        botJoin.fromTargetToCrown
       );
     } else {
       // Spurless bottom-right sweep (zero stair-step ledges)
@@ -3472,17 +3575,23 @@ Object.assign(GLYPH_BUILDERS, {
     const cx = (xL + xR) * 0.5;
     const bowlCenterX = lerp(cx - V * 0.06, cx, sp);
     const bowlRxLeft = bowlCenterX - xL;
+    const bowlRxRight = xR - bowlCenterX;
     const bowlRy = (topY - bowlBotY) * 0.5;
-    const botRightSpan = Math.max(12, xR - V - bowlCenterX);
-    const baseNotch = lerp(Math.min(xh * 0.075, V * 0.24), Math.min(xh * 0.02, V * 0.06), sp);
     const trapNotch = xh * 0.22 * m.inkTraps * m.trapDepth;
-    const botNotch = Math.min(baseNotch + trapNotch, botRightSpan * 0.36);
-    const botCrownX = lerp(xR - V - botRightSpan * 0.55, bowlCenterX, 0.35);
-    const botStemSpan = Math.max(10, xR - V - botCrownX);
-    const botRxLeft = botCrownX - xL;
+
+    const botSplit = splitSuperellipseQuadrantAtX(
+      bowlCenterX,
+      bowlMidY,
+      bowlRxRight,
+      bowlRy,
+      1,
+      -1,
+      xR - V,
+      kOut,
+      trapNotch
+    );
 
     // Two-stage spurless transition at top-right of 'g'
-    const topNotch = Math.min(baseNotch + trapNotch, botRightSpan * 0.38) * Math.max(0, 1 - sp / 0.35);
     const spurCurveStartY = lerp(topY - H * 0.45, bowlMidY, clamp((sp - 0.35) / 0.65, 0, 1));
     const spurTopY = sp < 0.35 ? xh : spurCurveStartY;
 
@@ -3533,32 +3642,24 @@ Object.assign(GLYPH_BUILDERS, {
         x: xR - V,
         y: descTurnY,
       },
-      // Up inner stem wall to bottom bowl notch
-      { type: 'pt', x: xR - V, y: bowlBotY + botNotch, r: 0.15 },
+      // Up inner stem wall to bottom bowl split
+      { type: 'pt', x: xR - V, y: botSplit.joinY, r: 0.15 },
       ...(m.inkTraps > 0.02
         ? [
             {
               type: 'pt',
               x: xR - V + V * 0.26 * m.inkTraps * m.trapDepth,
-              y: bowlBotY + botNotch + V * 0.12 * m.inkTraps * m.trapDepth,
+              y: botSplit.joinY + V * 0.12 * m.inkTraps * m.trapDepth,
               r: 0,
             },
           ]
         : []),
-      // Bottom bowl crown (uses botStemSpan so c2x never overshoots into right stem!)
-      {
-        type: 'cubic',
-        c1x: xR - V - botStemSpan * 0.22,
-        c1y: lerp(bowlBotY + botNotch, bowlBotY, 0.80),
-        c2x: botCrownX + botStemSpan * kOut,
-        c2y: bowlBotY,
-        x: botCrownX,
-        y: bowlBotY,
-      },
+      // Bottom bowl crown via exact de Casteljau split
+      botSplit.fromTargetToCrown,
       // Left bowl cheek
       {
         type: 'cubic',
-        c1x: botCrownX - botRxLeft * kOut,
+        c1x: bowlCenterX - bowlRxLeft * kOut,
         c1y: bowlBotY,
         c2x: xL,
         c2y: bowlMidY - bowlRy * kOut,
@@ -3578,28 +3679,32 @@ Object.assign(GLYPH_BUILDERS, {
     ];
 
     if (sp < 0.35) {
-      const topRightSpan = Math.max(12, xR - V - bowlCenterX);
+      const spLocal = sp / 0.35;
+      const touchX = lerp(xR - V, xR, spLocal * 0.65);
+      const topSplit = splitSuperellipseQuadrantAtX(
+        bowlCenterX,
+        bowlMidY,
+        bowlRxRight,
+        bowlRy,
+        1,
+        1,
+        touchX,
+        kOut,
+        trapNotch * (1 - spLocal)
+      );
       outer.push(
-        {
-          type: 'cubic',
-          c1x: bowlCenterX + topRightSpan * kOut,
-          c1y: topY,
-          c2x: xR - V - topRightSpan * 0.22,
-          c2y: lerp(topY - topNotch, topY, 0.72),
-          x: xR - V,
-          y: topY - topNotch,
-        },
+        topSplit.fromCrownToTarget,
         ...(m.inkTraps > 0.02
           ? [
               {
                 type: 'pt',
-                x: xR - V + V * 0.26 * m.inkTraps * m.trapDepth * (1 - sp / 0.35),
-                y: topY - topNotch - V * 0.12 * m.inkTraps * m.trapDepth * (1 - sp / 0.35),
+                x: touchX + V * 0.26 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                y: topSplit.joinY - V * 0.12 * m.inkTraps * m.trapDepth * (1 - spLocal),
                 r: 0,
               },
             ]
           : []),
-        { type: 'pt', x: xR - V, y: xh, r: 0.8 }
+        { type: 'pt', x: touchX, y: xh, r: 0.8 * (1 - spLocal) }
       );
     } else {
       // Continuous spurless top-right sweep
@@ -3699,7 +3804,8 @@ Object.assign(GLYPH_BUILDERS, {
     const loLegW = Math.min(m.D1 * 1.00, w * 0.40);
 
     const midY = m.xh * (0.46 + m.crossbarShift * 0.14);
-    const crotchX = xL + V + (xR - (xL + V)) * 0.24;
+    const crotchOffset = clamp(Math.max(upArmW, loLegW) * 1.10, 14, (xR - (xL + V)) * 0.34);
+    const crotchX = xL + V + crotchOffset;
     const joinTopY = Math.min(m.xh * 0.82, midY + upArmW * 0.45);
     const joinBotY = Math.max(m.xh * 0.14, midY - upArmW * 0.45);
 
@@ -3855,8 +3961,8 @@ Object.assign(GLYPH_BUILDERS, {
 
     const leftW = Math.min(m.D1 * 0.90, w * 0.305);
     const rightW = Math.min(m.D2 * 0.86, w * 0.295);
-    const botHalfW = Math.min(w * 0.22, Math.max((leftW + rightW) * 0.36, w * 0.125));
-    const innerApexY = Math.min(xh * 0.68, Math.max(leftW, rightW) * 0.95);
+    const botHalfW = clamp((leftW + rightW) * 0.54, m.V * 0.54, w * 0.22);
+    const innerApexY = clamp((leftW + rightW) * 0.56, m.H * 1.05, xh * 0.68);
 
     pc.addPolygon([
       [cx - botHalfW, 0, { r: 1 }],
@@ -3883,11 +3989,11 @@ Object.assign(GLYPH_BUILDERS, {
     const s2 = Math.min(m.D2 * 0.73, w * 0.185);
     const v1X = xL + w * 0.27;
     const v2X = xR - w * 0.27;
-    const botHalf = Math.min(w * 0.125, Math.max((s1 + s2) * 0.45, w * 0.085));
-    const midTopHalf = Math.min(w * 0.11, Math.max((s1 + s2) * 0.42, w * 0.075));
+    const botHalf = clamp((s1 + s2) * 0.52, m.V * 0.46, w * 0.125);
+    const midTopHalf = clamp((s1 + s2) * 0.48, m.V * 0.42, w * 0.11);
     const midTopY = xh * 0.96;
-    const innerBotY = Math.min(xh * 0.68, Math.max(s1, s2) * 1.15);
-    const innerMidY = Math.max(xh * 0.30, xh - Math.max(s1, s2) * 1.15);
+    const innerBotY = clamp((s1 + s2) * 0.62, m.H * 1.05, xh * 0.68);
+    const innerMidY = clamp(xh - (s1 + s2) * 0.62, xh * 0.30, xh - m.H * 1.05);
 
     pc.addPolygon([
       [v1X - botHalf, 0, { r: 0.9 }],
@@ -3920,10 +4026,11 @@ Object.assign(GLYPH_BUILDERS, {
     const d1 = Math.min(m.D1 * 0.88, w * 0.31);
     const d2 = Math.min(m.D2 * 0.85, w * 0.30);
     const dAvg = (d1 + d2) * 0.5;
-    const waistHalfX = Math.max(dAvg * 0.52, w * 0.085);
-    const waistHalfY = Math.min(
-      xh * 0.26,
-      Math.max((xh * 0.5) * (dAvg / Math.max(dAvg * 1.4, w - dAvg)), xh * 0.085)
+    const waistHalfX = clamp(dAvg * 0.58, m.V * 0.52, w * 0.24);
+    const waistHalfY = clamp(
+      (xh * 0.5) * (waistHalfX / Math.max(dAvg * 1.2, w * 0.5 - dAvg * 0.45)),
+      m.H * 0.52,
+      xh * 0.26
     );
 
     pc.addPolygon([
@@ -3954,10 +4061,10 @@ Object.assign(GLYPH_BUILDERS, {
 
     const leftW = Math.min(m.D1 * 0.90, w * 0.305);
     const rightW = Math.min(m.D2 * 0.86, w * 0.295);
-    const botHalfW = Math.min(w * 0.21, Math.max((leftW + rightW) * 0.35, w * 0.125));
-    const innerApexY = Math.min(xh * 0.68, Math.max(leftW, rightW) * 0.95);
+    const botHalfW = clamp((leftW + rightW) * 0.52, m.V * 0.52, w * 0.21);
+    const innerApexY = clamp((leftW + rightW) * 0.56, m.H * 1.05, xh * 0.68);
     // Collinear continuation of right leg down to descender
-    const rightSlope = ((xR - (cx + botHalfW)) / xh) * 0.88;
+    const rightSlope = (xR - (cx + botHalfW)) / xh;
     const descShift = Math.abs(m.desc) * rightSlope;
 
     pc.addPolygon([
@@ -4089,10 +4196,10 @@ Object.assign(GLYPH_BUILDERS, {
       { type: 'pt', x: xL, y: H * 0.96, r: 0.6 },
       {
         type: 'cubic',
-        c1x: xL + w * 0.22,
-        c1y: cap * 0.30,
+        c1x: lerp(xL, xR - V * 0.94, 0.32),
+        c1y: lerp(H * 0.96, bowlMidY, 0.42),
         c2x: xR - V * 0.94,
-        c2y: lerp(H, bowlMidY, 0.58),
+        c2y: lerp(H * 0.96, bowlMidY, 0.64),
         x: xR - V * 0.94,
         y: bowlMidY,
       },
@@ -4136,13 +4243,13 @@ Object.assign(GLYPH_BUILDERS, {
       {
         type: 'cubic',
         c1x: xR,
-        c1y: cap * 0.42,
-        c2x: xL + V * 1.35,
-        c2y: H * 1.45,
-        x: xL + V * 1.12,
+        c1y: lerp(H, bowlMidY, 0.58),
+        c2x: lerp(xL + V * 1.08, xR, 0.32),
+        c2y: lerp(H, bowlMidY, 0.36),
+        x: xL + V * 1.08,
         y: H,
       },
-      { type: 'pt', x: xL + V * 1.12, y: H, r: 0.25, trap: { d: 1.15, w: 0.85, bx: -0.85, by: -0.5 } },
+      { type: 'pt', x: xL + V * 1.08, y: H, r: 0.25, trap: { d: 1.15, w: 0.85, bx: -0.85, by: -0.5 } },
       { type: 'pt', x: xR, y: H, r: 1 },
       { type: 'pt', x: xR, y: 0, r: 1 }],
     );
@@ -4180,7 +4287,11 @@ Object.assign(GLYPH_BUILDERS, {
     const botTermInY = lerp(botTermOutY + H * 0.3, botTermOutY, m.termCut * 0.8);
 
     const waistL = cx - w * 0.08;
-    const waistPinchR = cx + w * 0.20;
+    const waistPinchR = clamp(
+      lerp(waistL + V * 1.25, cx + w * 0.20, m.wNorm),
+      waistL + H * 1.05,
+      cx + w * 0.24
+    );
     const trapIn = m.inkTraps > 0.01 ? V * 0.34 * m.inkTraps * m.trapDepth : 0;
 
     pc.addMixedContour([
@@ -4518,7 +4629,7 @@ Object.assign(GLYPH_BUILDERS, {
     const loRx = w * 0.50;
     const upMidY = (waistY + topY) * 0.5;
     const loMidY = (botY + waistY) * 0.5;
-    const pinchRx = w * 0.34;
+    const pinchRx = clamp(lerp(V * 1.25 + w * 0.14, w * 0.35, m.wNorm), w * 0.18, w * 0.36);
     const trapIn = m.inkTraps > 0.01 ? V * 0.28 * m.inkTraps * m.trapDepth : 0;
 
     // Outer figure-8 CW contour
@@ -4602,11 +4713,11 @@ Object.assign(GLYPH_BUILDERS, {
 
     // Upper and Lower CCW oval counters
     const upInRx = Math.max(18, upRx - V * 0.94);
-    const upInRy = Math.max(15, (topY - waistY) * 0.5 - H * 0.74);
+    const upInRy = Math.max(15, (topY - waistY) * 0.5 - H * 0.62);
     const loInRx = Math.max(20, loRx - V * 0.94);
-    const loInRy = Math.max(16, (waistY - botY) * 0.5 - H * 0.74);
-    pc.addSuperellipse(cx, upMidY - H * 0.08, upInRx, upInRy, -1);
-    pc.addSuperellipse(cx, loMidY + H * 0.08, loInRx, loInRy, -1);
+    const loInRy = Math.max(16, (waistY - botY) * 0.5 - H * 0.62);
+    pc.addSuperellipse(cx, upMidY - H * 0.04, upInRx, upInRy, -1);
+    pc.addSuperellipse(cx, loMidY + H * 0.04, loInRx, loInRy, -1);
     return adv;
   },
 
@@ -4641,7 +4752,18 @@ function buildSixOrNine(pc, m, isNine) {
   const topTermOutY = cap * lerp(0.74, 0.66, m.aperture);
   const topTermInX = topTermX - V * 0.94;
   const topTermInY = lerp(topTermOutY - H * 0.32, topTermOutY, m.termCut * 0.8);
-  const notchY = bowlTopY - lerp(cap * 0.06, cap * 0.16, m.inkTraps * m.trapDepth);
+  const trapExtra = cap * 0.14 * m.inkTraps * m.trapDepth;
+  const bowlSplit = splitSuperellipseQuadrantAtX(
+    cx + w * 0.04,
+    bowlMidY,
+    cx + w * 0.04 - xL,
+    bowlTopY - bowlMidY,
+    -1,
+    1,
+    xL + V * 0.96,
+    kOut,
+    trapExtra
+  );
 
   const outer6 = [
     { type: 'pt', x: topTermX, y: topTermOutY, r: 0.75 },
@@ -4659,14 +4781,14 @@ function buildSixOrNine(pc, m, isNine) {
       c1x: lerp(cx, xL, kOut),
       c1y: topY,
       c2x: xL,
-      c2y: lerp(cap * 0.48, topY, kOut),
+      c2y: lerp(bowlMidY, topY, kOut),
       x: xL,
-      y: cap * 0.46,
+      y: bowlMidY,
     },
     {
       type: 'cubic',
       c1x: xL,
-      c1y: lerp(cap * 0.46, botY, kOut),
+      c1y: lerp(bowlMidY, botY, kOut),
       c2x: lerp(cx, xL, kOut),
       c2y: botY,
       x: cx,
@@ -4690,30 +4812,22 @@ function buildSixOrNine(pc, m, isNine) {
       x: cx + w * 0.04,
       y: bowlTopY,
     },
-    {
-      type: 'cubic',
-      c1x: lerp(cx + w * 0.04, xL + V, 0.55),
-      c1y: bowlTopY,
-      c2x: xL + V * 1.15,
-      c2y: lerp(notchY, bowlTopY, 0.65),
-      x: xL + V * 0.98,
-      y: notchY,
-    },
+    bowlSplit.fromCrownToTarget,
     ...(m.inkTraps > 0.02
       ? [
           {
             type: 'pt',
-            x: xL + V * (0.98 - 0.26 * m.inkTraps * m.trapDepth),
-            y: notchY - V * 0.14 * m.inkTraps * m.trapDepth,
+            x: xL + V * (0.96 - 0.26 * m.inkTraps * m.trapDepth),
+            y: bowlSplit.joinY - V * 0.14 * m.inkTraps * m.trapDepth,
             r: 0,
           },
         ]
       : []),
     {
       type: 'cubic',
-      c1x: xL + V * 0.98,
-      c1y: lerp(notchY, topY - H, kIn),
-      c2x: lerp(cx + w * 0.02, xL + V * 0.98, kIn),
+      c1x: xL + V * 0.96,
+      c1y: lerp(bowlSplit.joinY, topY - H, kIn),
+      c2x: lerp(cx + w * 0.02, xL + V * 0.96, kIn),
       c2y: topY - H,
       x: cx + w * 0.02,
       y: topY - H,
@@ -4770,6 +4884,22 @@ Object.assign(GLYPH_BUILDERS, {
     const sb = Math.round(45 * clamp(m.widthScale, 0.75, 1.15));
     const cx = sb + r;
     pc.addSuperellipse(cx, r * 0.92, r, r, 1);
+    return Math.round((sb + r) * 2);
+  },
+
+  '·'(pc, m) {
+    const r = Math.max(22, m.V * 0.52);
+    const sb = Math.round(52 * clamp(m.widthScale, 0.75, 1.15));
+    const cx = sb + r;
+    pc.addSuperellipse(cx, m.cap * 0.5, r, r, 1);
+    return Math.round((sb + r) * 2);
+  },
+
+  '•'(pc, m) {
+    const r = Math.max(32, m.V * 0.72);
+    const sb = Math.round(52 * clamp(m.widthScale, 0.75, 1.15));
+    const cx = sb + r;
+    pc.addSuperellipse(cx, m.cap * 0.5, r, r, 1);
     return Math.round((sb + r) * 2);
   },
 
