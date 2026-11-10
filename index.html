@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FONTR55 — Parametric Variable Typeface Studio</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <!-- Password Gate Modal Overlay (Password: FONTR55) -->
+  <div id="auth-gate" class="auth-gate" role="dialog" aria-modal="true" aria-labelledby="auth-title" aria-describedby="auth-desc">
+    <div class="auth-card">
+      <div class="auth-badge">FOUNDRY ACCESS · EXPERIMENTAL BUILD</div>
+      <h1 id="auth-title" class="auth-title">FONTR55 Type Lab</h1>
+      <p id="auth-desc" class="auth-subtitle">
+        Interactive parametric typeface engine with continuous Spurless, Surgical Ink-Trap, Grotesque Aperture, and High-Contrast Elegance morphing.
+      </p>
+
+      <form id="auth-form" class="auth-form" method="POST" action="#unlock" novalidate>
+        <!-- Hidden username field for password manager accessibility -->
+        <input type="text" name="username" value="FONTR55-Studio" autocomplete="username" class="visually-hidden" tabindex="-1" aria-hidden="true">
+
+        <div class="field-group">
+          <div class="field-label-row">
+            <label for="access-password" class="field-label">Access Password <span aria-hidden="true">*</span></label>
+            <span class="field-hint">Studio Key Required</span>
+          </div>
+          <div class="password-input-wrap">
+            <input
+              type="password"
+              id="access-password"
+              name="password"
+              autocomplete="current-password"
+              autocorrect="off"
+              autocapitalize="none"
+              spellcheck="false"
+              enterkeyhint="done"
+              required
+              aria-describedby="auth-error"
+              class="password-input"
+            >
+            <button
+              type="button"
+              id="toggle-password-btn"
+              class="toggle-password-btn"
+              aria-pressed="false"
+              aria-label="Show password"
+            >
+              Show
+            </button>
+          </div>
+          <p id="auth-error" class="auth-error" role="alert" hidden>
+            Incorrect studio password. Please enter the authorized passkey.
+          </p>
+        </div>
+
+        <button type="submit" class="auth-submit-btn">Unlock Font Studio</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Main Font Tool Application Shell -->
+  <div id="app-shell" class="app-shell" inert>
+    <header class="top-bar">
+      <!-- Top Row: Size Slider, Live Axis Readout, Undo/Redo/Reset/Export -->
+      <div class="top-bar-row top-bar-primary">
+        <div class="top-left-controls">
+          <div class="size-control">
+            <label for="size-slider" class="top-label">Size</label>
+            <input
+              type="range"
+              id="size-slider"
+              class="range-slider top-size-slider"
+              min="25"
+              max="200"
+              step="1"
+              value="100"
+            >
+            <span id="size-readout" class="top-readout">100%</span>
+          </div>
+
+          <div class="live-metrics-summary" id="live-metrics-summary" aria-live="polite">
+            <strong>Weight</strong> <span id="summary-weight">1000</span>
+            <span class="dot-sep">·</span>
+            <strong>Width</strong> <span id="summary-width">84%</span>
+            <span id="summary-extra" class="summary-extra"></span>
+          </div>
+        </div>
+
+        <div
+          class="top-right-actions"
+          role="toolbar"
+          focusgroup="toolbar wrap"
+          aria-label="Specimen actions and export"
+        >
+          <div role="group" aria-label="History">
+            <button type="button" id="btn-undo" class="ui-btn" aria-disabled="true">Undo</button>
+            <button type="button" id="btn-redo" class="ui-btn" aria-disabled="true">Redo</button>
+          </div>
+          <span role="separator" aria-orientation="vertical" class="toolbar-sep"></span>
+          <div role="group" aria-label="Reset and Inspector">
+            <button type="button" id="btn-inspector" class="ui-btn" aria-pressed="false" title="Toggle Bézier nodes & metric guides">Vector Guides</button>
+            <button type="button" id="btn-reset" class="ui-btn">Reset sliders</button>
+          </div>
+          <span role="separator" aria-orientation="vertical" class="toolbar-sep"></span>
+          <div role="group" aria-label="Export">
+            <button type="button" id="btn-export-ttf" class="ui-btn">Export .TTF</button>
+            <button type="button" id="btn-export-svg" class="ui-btn ui-btn-primary">Export SVG</button>
+            <button type="button" id="btn-lock" class="ui-btn ui-btn-subtle" title="Lock studio session" aria-label="Lock studio session">Lock</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Second Row: Character Set Toggles + Instruction + Reference Style Morph Presets -->
+      <div class="top-bar-row top-bar-secondary">
+        <div
+          class="charset-toolbar"
+          role="toolbar"
+          focusgroup="toolbar wrap"
+          aria-label="Character sets"
+          aria-controls="specimen-stage"
+        >
+          <div role="group" aria-label="Toggle character sets" class="charset-group">
+            <button type="button" class="pill-btn" data-charset="capitals" aria-pressed="true">Capitals</button>
+            <button type="button" class="pill-btn" data-charset="lowercase" aria-pressed="true">Lowercase</button>
+            <button type="button" class="pill-btn" data-charset="figures" aria-pressed="true">Figures</button>
+            <button type="button" class="pill-btn" data-charset="symbols" aria-pressed="false">Symbols</button>
+            <button type="button" class="pill-btn" data-charset="accents" aria-pressed="false">Accents</button>
+          </div>
+          <span role="separator" aria-orientation="vertical" class="toolbar-sep"></span>
+          <button type="button" id="btn-full-alphabet" class="pill-btn pill-action">Full alphabet</button>
+          <span class="specimen-instruction">
+            Click the letters to type or delete. Select some and delete the rest to focus on a few.
+          </span>
+        </div>
+
+        <!-- Reference Font Style Morph Bar -->
+        <div class="preset-bar" role="toolbar" focusgroup="toolbar wrap" aria-label="Reference font styles">
+          <span class="preset-bar-label">Style References:</span>
+          <div id="preset-buttons" role="group" aria-label="Foundry style presets" class="preset-buttons"></div>
+        </div>
+      </div>
+    </header>
+
+    <!-- Live Status Announcer for Assistive Tech -->
+    <p id="toolbar-status" role="status" class="visually-hidden"></p>
+
+    <!-- Interactive Vector Specimen Stage -->
+    <main class="specimen-main">
+      <div
+        id="specimen-stage"
+        class="specimen-stage"
+        tabindex="0"
+        role="textbox"
+        aria-multiline="true"
+        aria-label="Interactive font specimen canvas. Click any letter to place cursor, drag to select letters, or type on your keyboard."
+      >
+        <svg
+          id="specimen-svg"
+          class="specimen-svg"
+          xmlns="http://www.w3.org/2000/svg"
+          aria-hidden="true"
+        ></svg>
+      </div>
+    </main>
+
+    <!-- Bottom 5-Column Parametric Sliders Deck (Unblurred Foundry Control Matrix) -->
+    <section class="parameters-deck" aria-label="Parametric font controls">
+      <div id="slider-columns-grid" class="slider-columns-grid"></div>
+    </section>
+  </div>
+
+  <script type="module" src="./js/app.js"></script>
+</body>
+</html>
