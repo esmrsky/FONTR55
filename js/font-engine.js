@@ -87,15 +87,29 @@ export function computeMetrics(rawParams = {}) {
   // Scale stem slightly with widthScale so ultra-condensed black still preserves counters
   const V = rawV * clamp(0.76 + 0.26 * widthScale, 0.72, 1.08);
 
-  // Elegance / Stroke Contrast (0% = monoline optical 0.85*V, 100% = high-contrast 0.21*V)
+  // Elegance / Stroke Contrast & Calligraphic Stress Axis (-25° to +30°)
   const eleg = clamp(p.elegance / 100, 0, 1);
-  const contrastRad = (clamp(p.contrastAngle, 0, 35) * Math.PI) / 180;
-  const baseHRatio = lerp(0.85, 0.21, Math.pow(eleg, 0.88));
+  const stressDeg = clamp(p.contrastAngle, -30, 35);
+  const stressRad = (stressDeg * Math.PI) / 180;
+  const stressBias = clamp(stressDeg / 26, -1, 1); // -1 (reverse stress) .. 0 (vertical) .. +1 (humanist broad-nib)
+  const stressMag = Math.abs(stressBias);
+  // Tilting the Contrast Axis automatically activates calligraphic contrast even when Elegance is at 0%
+  const effEleg = clamp(Math.max(eleg, stressMag * 0.52), 0, 1);
+
+  const baseHRatio = lerp(0.85, 0.21, Math.pow(effEleg, 0.88));
   const H = Math.max(14, V * baseHRatio);
 
-  // Diagonal primary (\) and secondary (/) stroke thicknesses
-  const D1 = V * lerp(0.97, 1.03, eleg * Math.cos(contrastRad));
-  const D2 = Math.max(15, V * lerp(0.92, 0.26, Math.pow(eleg, 0.85)));
+  // Diagonal primary (\) and secondary (/) stroke thicknesses respond to both Elegance and Contrast Axis sign
+  const thickDiag = V * lerp(0.97, 1.05, effEleg);
+  const thinDiag = Math.max(15, V * lerp(0.92, 0.26, Math.pow(effEleg, 0.85)));
+  const D1 =
+    stressBias >= 0
+      ? lerp(thickDiag, thickDiag * 1.04, stressBias)
+      : lerp(thickDiag, thinDiag * 0.92, -stressBias);
+  const D2 =
+    stressBias >= 0
+      ? lerp(thinDiag, thinDiag * 0.85, stressBias)
+      : lerp(thinDiag, thickDiag * 1.03, -stressBias);
 
   // Curve superellipse tension kappa
   const sq = clamp(p.squaring / 100, 0, 1);
@@ -137,6 +151,11 @@ export function computeMetrics(rawParams = {}) {
     D1,
     D2,
     eleg,
+    effEleg,
+    stressDeg,
+    stressRad,
+    stressBias,
+    stressMag,
     kappaOut,
     kappaIn,
     ov,
@@ -496,6 +515,40 @@ export class PathCompiler {
   }
 
   /**
+   * Apply affine calligraphic stress axis rotation/shear to an inner counter's nodes.
+   * Preserves G2 tangent collinearity and CCW winding at all Contrast Axis angles (-25° to +30°).
+   */
+  applyCounterStress(nodes, cx, cy, rx, ry, maxShiftX = null, maxShiftY = null) {
+    const s = this.m.stressBias || 0;
+    if (Math.abs(s) < 0.005 || rx <= 2 || ry <= 2) return nodes;
+    const sxMax = maxShiftX ?? Math.min(rx * 0.44, this.m.V * 0.50);
+    const syMax = maxShiftY ?? Math.min(ry * 0.44, this.m.H * 0.56);
+    const kx = (s * sxMax) / Math.max(1, ry);
+    const ky = (s * syMax) / Math.max(1, rx);
+
+    const tx = (x, y) => x + kx * (y - cy);
+    const ty = (x, y) => y - ky * (x - cx);
+
+    return nodes.map((nd) => {
+      if (nd.type === 'cubic' || nd.cmd === 'C') {
+        return {
+          ...nd,
+          c1x: tx(nd.c1x, nd.c1y),
+          c1y: ty(nd.c1x, nd.c1y),
+          c2x: tx(nd.c2x, nd.c2y),
+          c2y: ty(nd.c2x, nd.c2y),
+          x: tx(nd.x, nd.y),
+          y: ty(nd.x, nd.y),
+        };
+      }
+      if (nd.x !== undefined && nd.y !== undefined) {
+        return { ...nd, x: tx(nd.x, nd.y), y: ty(nd.x, nd.y) };
+      }
+      return nd;
+    });
+  }
+
+  /**
    * Add a superelliptical ring or oval contour:
    * dir = 1 for CW (outer contour), -1 for CCW (inner counter)
    */
@@ -517,14 +570,15 @@ export class PathCompiler {
       ]);
     } else {
       // CCW in +Y-up font space: Left -> Bottom -> Right -> Top -> Left
-      this.contours.push([
+      const raw = [
         { cmd: 'M', x: cx - rx, y: cy },
         { cmd: 'C', c1x: cx - rx, c1y: cy - ky, c2x: cx - kx, c2y: cy - ry, x: cx, y: cy - ry },
         { cmd: 'C', c1x: cx + kx, c1y: cy - ry, c2x: cx + rx, c2y: cy - ky, x: cx + rx, y: cy },
         { cmd: 'C', c1x: cx + rx, c1y: cy + ky, c2x: cx + kx, c2y: cy + ry, x: cx, y: cy + ry },
         { cmd: 'C', c1x: cx - kx, c1y: cy + ry, c2x: cx - rx, c2y: cy + ky, x: cx - rx, y: cy },
         { cmd: 'Z' },
-      ]);
+      ];
+      this.contours.push(this.applyCounterStress(raw, cx, cy, rx, ry));
     }
   }
 
@@ -686,48 +740,63 @@ function addOpenBowlContour(pc, m, {
         y: outBotY,
       },
       // Inner bottom-right terminal
-      { type: 'pt', x: inBotX, y: inBotY, r: 0.75 },
-      // Curve down-left to inner bottom crown (cx, cy - iy)
-      {
-        type: 'cubic',
-        c1x: inBotX - ix * Math.sin(botA) * kIn * botFrac * 0.65,
-        c1y: lerp(inBotY, cy - iy, 0.62),
-        c2x: cx + kxIn * botFrac,
-        c2y: cy - iy,
-        x: cx,
-        y: cy - iy,
-      },
-      // Inner bottom -> Inner left wall (cx - ix, cy)
-      {
-        type: 'cubic',
-        c1x: cx - kxIn,
-        c1y: cy - iy,
-        c2x: cx - ix,
-        c2y: cy - kyIn,
-        x: cx - ix,
-        y: cy,
-      },
-      // Inner left wall -> Inner top crown (cx, cy + iy)
-      {
-        type: 'cubic',
-        c1x: cx - ix,
-        c1y: cy + kyIn,
-        c2x: cx - kxIn,
-        c2y: cy + iy,
-        x: cx,
-        y: cy + iy,
-      },
-      // Inner top crown -> Inner top-right terminal
-      {
-        type: 'cubic',
-        c1x: cx + kxIn * topFrac,
-        c1y: cy + iy,
-        c2x: inTopX - ix * Math.sin(topA) * kIn * topFrac * 0.65,
-        c2y: lerp(inTopY, cy + iy, 0.62),
-        x: inTopX,
-        y: inTopY,
-      }
+      { type: 'pt', x: inBotX, y: inBotY, r: 0.75 }
     );
+
+    const innerWall = pc.applyCounterStress(
+      [
+        // Curve down-left to inner bottom crown (cx, cy - iy)
+        {
+          type: 'cubic',
+          c1x: inBotX - ix * Math.sin(botA) * kIn * botFrac * 0.65,
+          c1y: lerp(inBotY, cy - iy, 0.62),
+          c2x: cx + kxIn * botFrac,
+          c2y: cy - iy,
+          x: cx,
+          y: cy - iy,
+        },
+        // Inner bottom -> Inner left wall (cx - ix, cy)
+        {
+          type: 'cubic',
+          c1x: cx - kxIn,
+          c1y: cy - iy,
+          c2x: cx - ix,
+          c2y: cy - kyIn,
+          x: cx - ix,
+          y: cy,
+        },
+        // Inner left wall -> Inner top crown (cx, cy + iy)
+        {
+          type: 'cubic',
+          c1x: cx - ix,
+          c1y: cy + kyIn,
+          c2x: cx - kxIn,
+          c2y: cy + iy,
+          x: cx,
+          y: cy + iy,
+        },
+        // Inner top crown -> Inner top-right terminal
+        {
+          type: 'cubic',
+          c1x: cx + kxIn * topFrac,
+          c1y: cy + iy,
+          c2x: inTopX - ix * Math.sin(topA) * kIn * topFrac * 0.65,
+          c2y: lerp(inTopY, cy + iy, 0.62),
+          x: inTopX,
+          y: inTopY,
+        },
+      ],
+      cx,
+      cy,
+      ix,
+      iy,
+      Math.min(ix * 0.36, vStroke * 0.44),
+      Math.min(iy * 0.36, hStroke * 0.48)
+    );
+    // Keep the final inner terminal endpoint anchored at (inTopX, inTopY)
+    innerWall[innerWall.length - 1].x = inTopX;
+    innerWall[innerWall.length - 1].y = inTopY;
+    nodes.push(...innerWall);
   }
 
   pc.addMixedContour(nodes);
@@ -754,10 +823,18 @@ function addSContour(pc, m, { xL, xR, topY, botY, vStroke, hStroke }) {
 
   const vS = Math.min(vStroke * 0.90, w * 0.32);
   const hS = Math.min(hStroke * 0.86, h * 0.19);
+  const sBias = m.stressBias || 0;
+  // Contrast Axis modulates diagonal spine weight (thicker for humanist +angle, thinner for reverse -angle)
   const spineThick = Math.min(
-    h * 0.205,
-    lerp(Math.max(hS * 1.04, vS * 0.80), Math.max(hS * 1.02, vS * 0.56), m.eleg * 0.55)
+    h * 0.215,
+    lerp(
+      Math.max(hS * 1.04, vS * 0.80),
+      Math.max(hS * 1.02, vS * 0.56),
+      m.effEleg * 0.55
+    ) * (1 + sBias * 0.20)
   );
+  const topCrownInShiftX = sBias * Math.min(w * 0.08, vS * 0.36);
+  const botCrownInShiftX = -topCrownInShiftX;
 
   // Spine top and bottom y at cx
   const spineTopY = waistY + spineThick * 0.5;
@@ -849,20 +926,20 @@ function addSContour(pc, m, { xL, xR, topY, botY, vStroke, hStroke }) {
       x: loR - vS,
       y: lowerInnerMidY,
     },
-    // 5. Lower-right inner cheek -> Bottom inner crown (cx, botY + hS)
+    // 5. Lower-right inner cheek -> Bottom inner crown (cx + botCrownInShiftX, botY + hS)
     {
       type: 'cubic',
       c1x: loR - vS,
       c1y: lerp(lowerInnerMidY, botY + hS, kIn),
-      c2x: lerp(cx, loR - vS, kIn),
+      c2x: lerp(cx + botCrownInShiftX, loR - vS, kIn),
       c2y: botY + hS,
-      x: cx,
+      x: cx + botCrownInShiftX,
       y: botY + hS,
     },
     // 6. Bottom inner crown -> Bottom-left inner terminal
     {
       type: 'cubic',
-      c1x: lerp(cx, botTermInX, kIn),
+      c1x: lerp(cx + botCrownInShiftX, botTermInX, kIn),
       c1y: botY + hS,
       c2x: botTermInX,
       c2y: lerp(botTermInY, botY + hS, kIn),
@@ -910,20 +987,20 @@ function addSContour(pc, m, { xL, xR, topY, botY, vStroke, hStroke }) {
       x: upL + vS,
       y: upperInnerMidY,
     },
-    // 11. Upper-left inner cheek -> Top inner crown (cx, topY - hS)
+    // 11. Upper-left inner cheek -> Top inner crown (cx + topCrownInShiftX, topY - hS)
     {
       type: 'cubic',
       c1x: upL + vS,
       c1y: lerp(upperInnerMidY, topY - hS, kIn),
-      c2x: lerp(cx, upL + vS, kIn),
+      c2x: lerp(cx + topCrownInShiftX, upL + vS, kIn),
       c2y: topY - hS,
-      x: cx,
+      x: cx + topCrownInShiftX,
       y: topY - hS,
     },
     // 12. Top inner crown -> Top-right inner terminal
     {
       type: 'cubic',
-      c1x: lerp(cx, topTermInX, kIn),
+      c1x: lerp(cx + topCrownInShiftX, topTermInX, kIn),
       c1y: topY - hS,
       c2x: topTermInX,
       c2y: lerp(topTermInY, topY - hS, kIn),
@@ -946,14 +1023,16 @@ function buildStemAndBowl(pc, m, mode) {
   const isAscender = mode === 'b' || mode === 'd';
   const isSpurAtBottom = mode === 'b' || mode === 'd';
 
-  const w = Math.round(575 * m.widthScale);
-  const sb = Math.round(52 * clamp(m.widthScale, 0.75, 1.15));
+  const w = Math.round(570 * m.widthScale);
+  const sb = Math.round(50 * clamp(m.widthScale, 0.75, 1.15));
   const adv = w + sb * 2;
   const xL = sb;
   const xR = sb + w;
+  const cx = (xL + xR) * 0.5;
 
-  const V = Math.min(m.V * 0.96, w * 0.39);
-  const H = Math.min(m.H * 0.94, m.xh * 0.30);
+  // Match 'o' stroke-to-counter proportions so b, d, p, q, o have identical optical density
+  const V = Math.min(m.V * 0.95, w * 0.355);
+  const H = Math.min(m.H * 0.92, m.xh * 0.285);
   const topY = m.xh + m.ov;
   const botY = -m.ov;
   const midY = m.xh * 0.5;
@@ -962,29 +1041,34 @@ function buildStemAndBowl(pc, m, mode) {
   const kIn = m.kappaIn;
   const sp = m.spurless; // 0 = full grotesque spur, 1 = pure continuous spurless
 
-  // Shoulder / notch depth where bowl meets stem
-  const baseNotch = lerp(Math.min(m.xh * 0.16, V * 0.55), m.xh * 0.28, m.inkTraps * m.trapDepth);
-  const spurNotch = baseNotch * (1 - sp);
-  const nonSpurNotch = baseNotch;
-
-  // Build in canonical 'b' orientation (left stem, spur at bottom-left, ascender at top-left)
-  // Then mirror X for 'd'/'q' and mirror Y around midY for 'p'/'q' (where m.xh - stemTop === m.desc)!
   const stemTop = isAscender ? m.asc : m.xh - m.desc;
-  const bowlCenterX = xL + V + (w - V) * lerp(0.45, 0.49, sp);
-  const bowlRx = xR - bowlCenterX;
+  const bowlCenterX = lerp(cx + V * 0.05, cx, sp);
+  const bowlRxRight = xR - bowlCenterX;
   const bowlRy = (topY - botY) * 0.5;
-
-  // Outer left bottom corner rises smoothly when spurless -> 1
-  const leftBotCornerY = lerp(0, midY, sp);
-  const botNotchY = lerp(botY + spurNotch, botY, sp);
-  const topNotchY = topY - nonSpurNotch;
 
   // Trap width at the stem-bowl notch
   const notchSpread = m.inkTraps > 0.01 ? V * 0.14 * m.inkTraps * m.trapWidth : 0;
+  const topTouchX = xL + V + notchSpread * 0.5;
+  const topStemSpan = Math.max(14, bowlCenterX - topTouchX);
+
+  // Cap notch depth relative to topStemSpan so heavy weights never pinch or slice the stem-side bowl
+  const baseNotchDepth = lerp(Math.min(m.xh * 0.075, V * 0.24), Math.min(m.xh * 0.02, V * 0.06), sp);
+  const trapNotchDepth = m.xh * 0.22 * m.inkTraps * m.trapDepth;
+  const nonSpurNotch = Math.min(baseNotchDepth + trapNotchDepth, topStemSpan * 0.36);
+  const topNotchY = topY - nonSpurNotch;
+  const nonSpurCrownX = lerp(topTouchX + topStemSpan * 0.55, bowlCenterX, 0.35);
+  const nonSpurRxRight = xR - nonSpurCrownX;
+  const nonSpurStemSpan = Math.max(10, nonSpurCrownX - topTouchX);
+
+  // Two-stage continuous Spurless transition:
+  // Stage 1 (sp 0..0.4): spur notch at baseline fills in smoothly without lifting the foot up the stem
+  // Stage 2 (sp 0.4..1.0): pure unbroken superellipse sweep from bottom crown into outer stem wall
+  const spCurveT = clamp((sp - 0.35) / 0.65, 0, 1);
+  const leftBotCornerY = sp < 0.35 ? 0 : midY;
 
   const outerB = [
     // Left stem bottom-left
-    { type: 'pt', x: xL, y: leftBotCornerY, r: sp > 0.5 ? 0 : 1 },
+    { type: 'pt', x: xL, y: leftBotCornerY, r: sp < 0.35 ? 1 - sp * 2.5 : 0 },
     // Left stem top-left
     { type: 'pt', x: xL, y: stemTop, r: 1 },
     // Left stem top-right
@@ -995,27 +1079,27 @@ function buildStemAndBowl(pc, m, mode) {
       ? [
           {
             type: 'pt',
-            x: xL + V - Math.min(V * 0.35, V * 0.32 * m.inkTraps * m.trapDepth),
+            x: xL + V - Math.min(V * 0.35, V * 0.30 * m.inkTraps * m.trapDepth),
             y: topNotchY - V * 0.12 * m.inkTraps * m.trapDepth,
             r: 0,
           },
         ]
       : []),
-    { type: 'pt', x: xL + V + notchSpread * 0.6, y: topNotchY, r: 0.15 },
-    // Curve up to top bowl crown (bowlCenterX, topY)
+    { type: 'pt', x: topTouchX, y: topNotchY, r: 0.15 },
+    // Curve up to non-spur bowl crown (nonSpurCrownX, topY)
     {
       type: 'cubic',
-      c1x: xL + V + (bowlCenterX - (xL + V)) * 0.25,
-      c1y: lerp(topNotchY, topY, 0.78),
-      c2x: bowlCenterX - bowlRx * kOut * 0.85,
+      c1x: topTouchX + nonSpurStemSpan * 0.22,
+      c1y: lerp(topNotchY, topY, 0.80),
+      c2x: nonSpurCrownX - nonSpurStemSpan * kOut,
       c2y: topY,
-      x: bowlCenterX,
+      x: nonSpurCrownX,
       y: topY,
     },
     // Top crown -> Right cheek (xR, midY)
     {
       type: 'cubic',
-      c1x: bowlCenterX + bowlRx * kOut,
+      c1x: nonSpurCrownX + nonSpurRxRight * kOut,
       c1y: topY,
       c2x: xR,
       c2y: midY + bowlRy * kOut,
@@ -1027,53 +1111,62 @@ function buildStemAndBowl(pc, m, mode) {
       type: 'cubic',
       c1x: xR,
       c1y: midY - bowlRy * kOut,
-      c2x: bowlCenterX + bowlRx * kOut,
+      c2x: bowlCenterX + bowlRxRight * kOut,
       c2y: botY,
       x: bowlCenterX,
       y: botY,
     },
   ];
 
-  if (sp < 0.98) {
-    // Spurred or partially-spurred bottom junction
+  if (sp < 0.35) {
+    // Classic spurred grotesque (sp 0..0.35): spur foot stays at baseline y=0 while notch shallows
+    const spLocal = sp / 0.35;
+    const botNotch = Math.min(baseNotchDepth + trapNotchDepth, topStemSpan * 0.38) * (1 - spLocal * 0.75);
+    const botNotchY = botY + botNotch;
+    const botTouchX = xL + V + notchSpread * 0.5 * (1 - spLocal);
+    const botCrownX = lerp(botTouchX + topStemSpan * 0.55, bowlCenterX, 0.35);
+    const botSpan = Math.max(10, botCrownX - botTouchX);
+    outerB[outerB.length - 1].x = botCrownX;
+    outerB[outerB.length - 1].c2x = botCrownX + (xR - botCrownX) * kOut;
     outerB.push(
       {
         type: 'cubic',
-        c1x: bowlCenterX - bowlRx * kOut * 0.85,
+        c1x: botCrownX - botSpan * kOut,
         c1y: botY,
-        c2x: xL + V + (bowlCenterX - (xL + V)) * 0.25,
-        c2y: lerp(botNotchY, botY, 0.78),
-        x: xL + V + notchSpread * 0.6 * (1 - sp),
+        c2x: botTouchX + botSpan * 0.22,
+        c2y: lerp(botNotchY, botY, 0.80),
+        x: botTouchX,
         y: botNotchY,
       },
-      ...(m.inkTraps > 0.02 && sp < 0.7
+      ...(m.inkTraps > 0.02
         ? [
             {
               type: 'pt',
-              x: xL + V - Math.min(V * 0.35, V * 0.30 * m.inkTraps * m.trapDepth * (1 - sp)),
-              y: botNotchY + V * 0.12 * m.inkTraps * m.trapDepth * (1 - sp),
+              x: xL + V - Math.min(V * 0.35, V * 0.28 * m.inkTraps * m.trapDepth * (1 - spLocal)),
+              y: botNotchY + V * 0.12 * m.inkTraps * m.trapDepth * (1 - spLocal),
               r: 0,
             },
           ]
         : []),
-      { type: 'pt', x: xL + V, y: (0 + leftBotCornerY) * 0.5, r: 0.8 },
-      { type: 'pt', x: xL + V * (1 - sp), y: leftBotCornerY * 0.15, r: 0.8 }
+      { type: 'pt', x: xL + V, y: 0, r: 0.9 * (1 - spLocal) }
     );
   } else {
-    // Pure Spurless (sp >= 0.98): continuous sweep from bottom crown directly into outer-left stem wall!
-    const fullRx = bowlCenterX - xL;
+    // Continuous Spurless sweep (sp 0.35..1.0): zero stair-step ledges, pure smooth curve into outer stem
+    const fullRxLeft = bowlCenterX - xL;
+    const kSpurX = lerp(0.76, kOut, spCurveT);
+    const kSpurY = lerp(0.82, kOut, spCurveT);
     outerB.push({
       type: 'cubic',
-      c1x: bowlCenterX - fullRx * kOut,
+      c1x: bowlCenterX - fullRxLeft * kSpurX,
       c1y: botY,
       c2x: xL,
-      c2y: midY - bowlRy * kOut,
+      c2y: midY - bowlRy * kSpurY,
       x: xL,
-      y: leftBotCornerY,
+      y: midY,
     });
   }
 
-  // Inner counter of 'b' (CCW)
+  // Inner counter of 'b' (CCW), centered at inCx === cx
   const inLeft = xL + V;
   const inRight = xR - V;
   const inTop = topY - H;
@@ -1143,7 +1236,15 @@ function buildStemAndBowl(pc, m, mode) {
     });
 
   pc.addMixedContour(transformNodes(outerB), 1);
-  pc.addMixedContour(transformNodes(innerB), -1);
+  // Apply calligraphic Contrast Axis in final glyph coordinates so b, d, p, q share the exact same stress angle
+  const stressedInner = pc.applyCounterStress(
+    transformNodes(innerB),
+    mapX(inCx),
+    mapY(midY),
+    inRx,
+    inRy
+  );
+  pc.addMixedContour(stressedInner, -1);
   return adv;
 }
 
@@ -1187,15 +1288,17 @@ function reverseMixedContour(nodes) {
  */
 function buildArchGlyph(pc, m, mode) {
   // mode: 'n' | 'h' | 'u' | 'r' | 'm'
+  const sBias = m.stressBias || 0;
+
   if (mode === 'm') {
-    const w = Math.round(845 * m.widthScale);
+    const w = Math.round(855 * m.widthScale);
     const sb = Math.round(48 * clamp(m.widthScale, 0.75, 1.15));
     const adv = w + sb * 2;
     const xL = sb;
     const xR = sb + w;
-    // 3 stems in 'm': optical density reduction so Weight 1000 stays crisp
-    const V = Math.min(m.V * 0.88, w * 0.255);
-    const H = Math.min(m.H * 0.90, m.xh * 0.30);
+    // 3 stems in 'm': optical density calibration so counters stay open & arches never blob
+    const V = Math.min(m.V * 0.85, w * 0.24);
+    const H = Math.min(m.H * 0.86, m.xh * 0.27);
     const topY = m.xh + m.ov;
     const sp = m.spurless;
     const kOut = m.kappaOut;
@@ -1203,14 +1306,7 @@ function buildArchGlyph(pc, m, mode) {
 
     const midStemL = xL + (w - V) * 0.5;
     const midStemR = midStemL + V;
-    const arch1Cx = lerp(xL + V, midStemR, 0.52);
-    const arch2Cx = lerp(midStemR, xR, 0.52);
-    const archDrop = m.xh * lerp(0.42, 0.28, m.shoulder);
-
-    const notchBase = lerp(Math.min(m.xh * 0.16, V * 0.55), m.xh * 0.30, m.inkTraps * m.trapDepth);
-    const notch1 = notchBase * (1 - sp);
-    const notch2 = notchBase;
-    const leftTopCornerY = lerp(m.xh, m.xh - archDrop, sp);
+    const midStemCx = xL + w * 0.5;
 
     const inArchTop = topY - H;
     const c1L = xL + V;
@@ -1219,65 +1315,94 @@ function buildArchGlyph(pc, m, mode) {
     const c2L = midStemR;
     const c2R = xR - V;
     const c2Mid = (c2L + c2R) * 0.5;
+    const cHalfW = Math.max(16, (c1R - c1L) * 0.5);
+
+    // Proportional semicircular inner arch radius so inner counter is never a tall pinched gothic slot!
+    const inArchRy = clamp(cHalfW * lerp(1.22, 0.92, m.shoulder), m.xh * 0.14, inArchTop - m.xh * 0.42);
+    const inTurnY = inArchTop - inArchRy;
+    const outTurnY = Math.max(m.xh * 0.48, inTurnY - H * 0.08);
+
+    // Center Arch 1 and Arch 2 crowns over Counter 1 and Counter 2
+    const arch1Cx = lerp(c1Mid + V * 0.08, c1Mid, sp);
+    const arch2Cx = lerp(c2Mid + V * 0.08, c2Mid, sp);
+    const valleyX = lerp(midStemL + V * 0.42, midStemCx, sp);
+
+    const notchBase = lerp(Math.min(m.xh * 0.14, V * 0.46), m.xh * 0.25, m.inkTraps * m.trapDepth);
+    const valleyDrop = lerp(notchBase, Math.min(m.xh * 0.19, (topY - outTurnY) * 0.56), sp);
+    const valleyY = topY - valleyDrop;
+
+    // Calligraphic stress shift for inner arches of 'm'
+    const stressDx = sBias * Math.min(cHalfW * 0.40, V * 0.34);
+    const stressDy = sBias * Math.min(inArchRy * 0.30, H * 0.35);
+
+    const spCurveT = clamp((sp - 0.35) / 0.65, 0, 1);
+    const leftTopCornerY = sp < 0.35 ? m.xh : outTurnY;
 
     const nodes = [
       { type: 'pt', x: xL, y: 0, r: 1 },
-      { type: 'pt', x: xL, y: leftTopCornerY, r: sp > 0.5 ? 0 : 1 },
+      { type: 'pt', x: xL, y: leftTopCornerY, r: sp < 0.35 ? 1 - sp * 2.5 : 0 },
     ];
 
-    if (sp < 0.98) {
+    if (sp < 0.35) {
+      const spLocal = sp / 0.35;
+      const notch1 = notchBase * (1 - spLocal * 0.75);
+      const leftSpan = Math.max(10, arch1Cx - (xL + V));
       nodes.push(
-        { type: 'pt', x: xL + V * (1 - sp), y: lerp(m.xh, leftTopCornerY, sp), r: 0.8 },
+        { type: 'pt', x: xL + V, y: m.xh, r: 0.9 * (1 - spLocal) },
         { type: 'pt', x: xL + V, y: topY - notch1, r: 0.15 },
-        ...(m.inkTraps > 0.02 && sp < 0.75
+        ...(m.inkTraps > 0.02
           ? [
               {
                 type: 'pt',
-                x: xL + V - V * 0.26 * m.inkTraps * m.trapDepth * (1 - sp),
-                y: topY - notch1 - V * 0.14 * m.inkTraps * m.trapDepth * (1 - sp),
+                x: xL + V - V * 0.25 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                y: topY - notch1 - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
                 r: 0,
               },
             ]
           : []),
         {
           type: 'cubic',
-          c1x: xL + V + (arch1Cx - (xL + V)) * 0.22,
-          c1y: lerp(topY - notch1, topY, 0.78),
-          c2x: arch1Cx - (arch1Cx - (xL + V)) * kOut,
+          c1x: xL + V + leftSpan * 0.22,
+          c1y: lerp(topY - notch1, topY, 0.76),
+          c2x: arch1Cx - leftSpan * kOut,
           c2y: topY,
           x: arch1Cx,
           y: topY,
         }
       );
     } else {
+      const kSpurX = lerp(0.76, kOut, spCurveT);
+      const kSpurY = lerp(0.82, kOut, spCurveT);
       nodes.push({
         type: 'cubic',
         c1x: xL,
-        c1y: lerp(leftTopCornerY, topY, kOut),
-        c2x: lerp(arch1Cx, xL, kOut),
+        c1y: lerp(outTurnY, topY, kSpurY),
+        c2x: arch1Cx - (arch1Cx - xL) * kSpurX,
         c2y: topY,
         x: arch1Cx,
         y: topY,
       });
     }
 
-    // Arch 1 down into middle valley (midStemR, topY - notch2)
+    // Arch 1 down into symmetric middle valley (valleyX, valleyY)
+    const valleySpan1 = Math.max(10, valleyX - arch1Cx);
+    const valleySpan2 = Math.max(10, arch2Cx - valleyX);
     nodes.push(
       {
         type: 'cubic',
-        c1x: lerp(arch1Cx, midStemR, kOut),
+        c1x: arch1Cx + valleySpan1 * kOut,
         c1y: topY,
-        c2x: midStemR,
-        c2y: lerp(topY - notch2, topY, 0.72),
-        x: midStemR,
-        y: topY - notch2,
+        c2x: valleyX,
+        c2y: lerp(valleyY, topY, 0.68),
+        x: valleyX,
+        y: valleyY,
       },
       ...(m.inkTraps > 0.02
         ? [
             {
               type: 'pt',
-              x: midStemR - V * 0.24 * m.inkTraps * m.trapDepth,
-              y: topY - notch2 - V * 0.15 * m.inkTraps * m.trapDepth,
+              x: valleyX - V * 0.18 * m.inkTraps * m.trapDepth * (1 - sp * 0.6),
+              y: valleyY - V * 0.15 * m.inkTraps * m.trapDepth,
               r: 0,
             },
           ]
@@ -1285,66 +1410,66 @@ function buildArchGlyph(pc, m, mode) {
       // Up Arch 2 to arch2Cx
       {
         type: 'cubic',
-        c1x: midStemR + (arch2Cx - midStemR) * 0.22,
-        c1y: lerp(topY - notch2, topY, 0.78),
-        c2x: arch2Cx - (arch2Cx - midStemR) * kOut,
+        c1x: valleyX + valleySpan2 * 0.22,
+        c1y: lerp(valleyY, topY, 0.74),
+        c2x: arch2Cx - valleySpan2 * kOut,
         c2y: topY,
         x: arch2Cx,
         y: topY,
       },
-      // Arch 2 down to outer right wall
+      // Arch 2 down to outer right wall at outTurnY
       {
         type: 'cubic',
-        c1x: lerp(arch2Cx, xR, kOut),
+        c1x: arch2Cx + (xR - arch2Cx) * kOut,
         c1y: topY,
         c2x: xR,
-        c2y: lerp(m.xh - archDrop, topY, kOut),
+        c2y: lerp(outTurnY, topY, kOut),
         x: xR,
-        y: m.xh - archDrop,
+        y: outTurnY,
       },
       { type: 'pt', x: xR, y: 0, r: 1 },
       { type: 'pt', x: c2R, y: 0, r: 1 },
-      { type: 'pt', x: c2R, y: m.xh - archDrop - H * 0.35, r: 0 },
+      { type: 'pt', x: c2R, y: inTurnY, r: 0 },
       // Inner Arch 2
       {
         type: 'cubic',
         c1x: c2R,
-        c1y: lerp(m.xh - archDrop - H * 0.35, inArchTop, kIn),
-        c2x: lerp(c2Mid, c2R, kIn),
+        c1y: lerp(inTurnY, inArchTop, kIn) - stressDy,
+        c2x: lerp(c2Mid + stressDx, c2R, kIn),
         c2y: inArchTop,
-        x: c2Mid,
+        x: c2Mid + stressDx,
         y: inArchTop,
       },
       {
         type: 'cubic',
-        c1x: lerp(c2Mid, c2L, kIn),
+        c1x: lerp(c2Mid + stressDx, c2L, kIn),
         c1y: inArchTop,
         c2x: c2L,
-        c2y: lerp(m.xh - archDrop - H * 0.35, inArchTop, kIn),
+        c2y: lerp(inTurnY, inArchTop, kIn) + stressDy,
         x: c2L,
-        y: m.xh - archDrop - H * 0.35,
+        y: inTurnY,
       },
       { type: 'pt', x: c2L, y: 0, r: 1 },
       { type: 'pt', x: c1R, y: 0, r: 1 },
-      { type: 'pt', x: c1R, y: m.xh - archDrop - H * 0.35, r: 0 },
+      { type: 'pt', x: c1R, y: inTurnY, r: 0 },
       // Inner Arch 1
       {
         type: 'cubic',
         c1x: c1R,
-        c1y: lerp(m.xh - archDrop - H * 0.35, inArchTop, kIn),
-        c2x: lerp(c1Mid, c1R, kIn),
+        c1y: lerp(inTurnY, inArchTop, kIn) - stressDy,
+        c2x: lerp(c1Mid + stressDx, c1R, kIn),
         c2y: inArchTop,
-        x: c1Mid,
+        x: c1Mid + stressDx,
         y: inArchTop,
       },
       {
         type: 'cubic',
-        c1x: lerp(c1Mid, c1L, kIn),
+        c1x: lerp(c1Mid + stressDx, c1L, kIn),
         c1y: inArchTop,
         c2x: c1L,
-        c2y: lerp(m.xh - archDrop - H * 0.35, inArchTop, kIn),
+        c2y: lerp(inTurnY, inArchTop, kIn) + stressDy,
         x: c1L,
-        y: m.xh - archDrop - H * 0.35,
+        y: inTurnY,
       },
       { type: 'pt', x: c1L, y: 0, r: 1 }
     );
@@ -1359,78 +1484,100 @@ function buildArchGlyph(pc, m, mode) {
     const adv = w + sb * 2;
     const xL = sb;
     const xR = sb + w;
-    const V = Math.min(m.V * 0.96, w * 0.48);
-    const H = Math.min(m.H * 0.96, m.xh * 0.32);
+    const V = Math.min(m.V * 0.95, w * 0.46);
+    const H = Math.min(m.H * 0.94, m.xh * 0.30);
     const topY = m.xh + m.ov;
     const sp = m.spurless;
     const kOut = m.kappaOut;
+    const kIn = m.kappaIn;
 
-    const notchBase = lerp(Math.min(m.xh * 0.18, V * 0.6), m.xh * 0.32, m.inkTraps * m.trapDepth);
-    const notch = notchBase * (1 - sp);
-    const leftTopCornerY = lerp(m.xh, m.xh * 0.56, sp);
-    const armCrownX = lerp(xL + V + (xR - (xL + V)) * 0.55, xR - w * 0.08, 0.5);
-    const termDrop = m.aperture * H * 0.55;
+    const turnY = m.xh * lerp(0.54, 0.62, m.shoulder * (1 - sp * 0.3));
+    const inTurnY = Math.min(turnY, topY - H - 18);
+    const notchBase = lerp(Math.min(m.xh * 0.16, V * 0.52), m.xh * 0.28, m.inkTraps * m.trapDepth);
+
+    const armCrownX = xL + V + (xR - (xL + V)) * 0.62;
+    const inCrownX = armCrownX + sBias * Math.min((xR - (xL + V)) * 0.18, V * 0.30);
+    const termDrop = m.aperture * H * 0.50;
+
+    const spCurveT = clamp((sp - 0.35) / 0.65, 0, 1);
+    const leftTopCornerY = sp < 0.35 ? m.xh : turnY;
 
     const nodes = [
       { type: 'pt', x: xL, y: 0, r: 1 },
-      { type: 'pt', x: xL, y: leftTopCornerY, r: sp > 0.5 ? 0 : 1 },
+      { type: 'pt', x: xL, y: leftTopCornerY, r: sp < 0.35 ? 1 - sp * 2.5 : 0 },
     ];
 
-    if (sp < 0.98) {
+    if (sp < 0.35) {
+      const spLocal = sp / 0.35;
+      const notch = notchBase * (1 - spLocal * 0.75);
+      const leftSpan = Math.max(10, armCrownX - (xL + V));
       nodes.push(
-        { type: 'pt', x: xL + V * (1 - sp), y: lerp(m.xh, leftTopCornerY, sp), r: 0.8 },
+        { type: 'pt', x: xL + V, y: m.xh, r: 0.9 * (1 - spLocal) },
         { type: 'pt', x: xL + V, y: topY - notch, r: 0.15 },
-        ...(m.inkTraps > 0.02 && sp < 0.75
+        ...(m.inkTraps > 0.02
           ? [
               {
                 type: 'pt',
-                x: xL + V - V * 0.28 * m.inkTraps * m.trapDepth * (1 - sp),
-                y: topY - notch - V * 0.14 * m.inkTraps * m.trapDepth * (1 - sp),
+                x: xL + V - V * 0.26 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                y: topY - notch - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
                 r: 0,
               },
             ]
           : []),
         {
           type: 'cubic',
-          c1x: xL + V + (armCrownX - (xL + V)) * 0.25,
-          c1y: lerp(topY - notch, topY, 0.82),
-          c2x: lerp(armCrownX, xL + V, kOut),
+          c1x: xL + V + leftSpan * 0.24,
+          c1y: lerp(topY - notch, topY, 0.78),
+          c2x: armCrownX - leftSpan * kOut,
           c2y: topY,
           x: armCrownX,
           y: topY,
         }
       );
     } else {
+      const kSpurX = lerp(0.76, kOut, spCurveT);
+      const kSpurY = lerp(0.82, kOut, spCurveT);
       nodes.push({
         type: 'cubic',
         c1x: xL,
-        c1y: lerp(leftTopCornerY, topY, kOut),
-        c2x: lerp(armCrownX, xL, kOut),
+        c1y: lerp(turnY, topY, kSpurY),
+        c2x: armCrownX - (armCrownX - xL) * kSpurX,
         c2y: topY,
         x: armCrownX,
         y: topY,
       });
     }
 
+    const inTermX = xR - H * 0.16 * (1 - m.termCut);
+    const inTermY = topY - H - termDrop * 0.85;
     nodes.push(
       {
         type: 'cubic',
         c1x: lerp(armCrownX, xR, 0.55),
         c1y: topY,
         c2x: xR,
-        c2y: topY - termDrop * 0.4,
+        c2y: topY - termDrop * 0.38,
         x: xR,
         y: topY - termDrop,
       },
-      { type: 'pt', x: xR - H * 0.18 * (1 - m.termCut), y: topY - H - termDrop, r: 0.7 },
+      { type: 'pt', x: inTermX, y: inTermY, r: 0.7 },
       {
         type: 'cubic',
-        c1x: lerp(xL + V, xR, 0.55),
+        c1x: lerp(inTermX, inCrownX, 0.45),
+        c1y: topY - H,
+        c2x: lerp(inCrownX, inTermX, 0.35),
+        c2y: topY - H,
+        x: inCrownX,
+        y: topY - H,
+      },
+      {
+        type: 'cubic',
+        c1x: lerp(inCrownX, xL + V, kIn),
         c1y: topY - H,
         c2x: xL + V,
-        c2y: lerp(m.xh * 0.48, topY - H, 0.68),
+        c2y: lerp(inTurnY, topY - H, kIn),
         x: xL + V,
-        y: m.xh * 0.46,
+        y: inTurnY,
       },
       { type: 'pt', x: xL + V, y: 0, r: 1 }
     );
@@ -1440,13 +1587,15 @@ function buildArchGlyph(pc, m, mode) {
   }
 
   // 'n', 'h', or 'u' (where 'u' is 180-degree rotated 'n')
-  const w = Math.round(555 * m.widthScale);
-  const sb = Math.round(52 * clamp(m.widthScale, 0.75, 1.15));
+  const w = Math.round(560 * m.widthScale);
+  const sb = Math.round(50 * clamp(m.widthScale, 0.75, 1.15));
   const adv = w + sb * 2;
   const xL = sb;
   const xR = sb + w;
-  const V = Math.min(m.V * 0.95, w * 0.39);
-  const H = Math.min(m.H * 0.94, m.xh * 0.31);
+  const cx = (xL + xR) * 0.5;
+  // Match 'o' stroke-to-counter proportions so n, u, o have identical arch thickness!
+  const V = Math.min(m.V * 0.94, w * 0.355);
+  const H = Math.min(m.H * 0.92, m.xh * 0.285);
   const topY = m.xh + m.ov;
   const sp = m.spurless;
   const kOut = m.kappaOut;
@@ -1455,52 +1604,66 @@ function buildArchGlyph(pc, m, mode) {
   const isH = mode === 'h';
   const isU = mode === 'u';
 
-  const archDrop = m.xh * lerp(0.44, 0.28, m.shoulder);
-  const notchBase = lerp(Math.min(m.xh * 0.16, V * 0.55), m.xh * 0.30, m.inkTraps * m.trapDepth);
-  const notch = isH ? notchBase : notchBase * (1 - sp);
-  const leftTopY = isH ? m.asc : lerp(m.xh, m.xh - archDrop, sp);
-  const archCx = lerp(xL + V + (xR - (xL + V)) * 0.48, (xL + xR) * 0.5, sp);
-  const inCx = (xL + V + (xR - V)) * 0.5;
   const inTop = topY - H;
+  const inCx = (xL + V + (xR - V)) * 0.5;
+  const inHalfW = Math.max(18, (xR - V - (xL + V)) * 0.5);
+
+  // Proportional semicircular inner arch radius so inner counter is circular and never swells at 10/2 o'clock!
+  const inArchRy = clamp(inHalfW * lerp(1.25, 0.94, m.shoulder), m.xh * 0.16, inTop - m.xh * 0.42);
+  const inTurnY = inTop - inArchRy;
+  const outTurnY = Math.max(m.xh * 0.48, inTurnY - H * 0.08);
+
+  const notchBase = lerp(Math.min(m.xh * 0.15, V * 0.48), m.xh * 0.26, m.inkTraps * m.trapDepth);
+  const archCx = lerp(cx + V * 0.05, cx, isH ? 0 : sp);
+
+  // Calligraphic stress shift for inner arch
+  const stressDx = sBias * Math.min(inHalfW * 0.42, V * 0.40);
+  const stressDy = sBias * Math.min(inArchRy * 0.32, H * 0.40);
+
+  const spCurveT = clamp((sp - 0.35) / 0.65, 0, 1);
+  const leftTopCornerY = isH ? m.asc : sp < 0.35 ? m.xh : outTurnY;
 
   const nNodes = [
     { type: 'pt', x: xL, y: 0, r: 1 },
-    { type: 'pt', x: xL, y: leftTopY, r: !isH && sp > 0.5 ? 0 : 1 },
+    { type: 'pt', x: xL, y: leftTopCornerY, r: isH ? 1 : sp < 0.35 ? 1 - sp * 2.5 : 0 },
   ];
 
-  if (isH || sp < 0.98) {
-    const spurR = isH ? xL + V : xL + V * (1 - sp);
-    const spurTop = isH ? m.asc : lerp(m.xh, leftTopY, sp);
+  if (isH || sp < 0.35) {
+    const spLocal = isH ? 0 : sp / 0.35;
+    const notch = notchBase * (1 - spLocal * 0.75);
+    const leftSpan = Math.max(12, archCx - (xL + V));
     nNodes.push(
-      { type: 'pt', x: spurR, y: spurTop, r: 0.8 },
+      { type: 'pt', x: xL + V, y: isH ? m.asc : m.xh, r: isH ? 1 : 0.9 * (1 - spLocal) },
       { type: 'pt', x: xL + V, y: topY - notch, r: 0.15 },
-      ...(m.inkTraps > 0.02 && (isH || sp < 0.75)
+      ...(m.inkTraps > 0.02
         ? [
             {
               type: 'pt',
-              x: xL + V - V * 0.28 * m.inkTraps * m.trapDepth * (isH ? 1 : 1 - sp),
-              y: topY - notch - V * 0.14 * m.inkTraps * m.trapDepth * (isH ? 1 : 1 - sp),
+              x: xL + V - V * 0.26 * m.inkTraps * m.trapDepth * (1 - spLocal),
+              y: topY - notch - V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
               r: 0,
             },
           ]
         : []),
       {
         type: 'cubic',
-        c1x: xL + V + (archCx - (xL + V)) * 0.24,
-        c1y: lerp(topY - notch, topY, 0.80),
-        c2x: lerp(archCx, xL + V, kOut),
+        c1x: xL + V + leftSpan * 0.22,
+        c1y: lerp(topY - notch, topY, 0.76),
+        c2x: archCx - leftSpan * kOut,
         c2y: topY,
         x: archCx,
         y: topY,
       }
     );
   } else {
-    // Pure Spurless 'n' / 'u': outer wall sweeps seamlessly over arch!
+    // Continuous Spurless 'n' / 'u': outer wall sweeps seamlessly over arch (concentric with 'o')
+    const kSpurX = lerp(0.76, kOut, spCurveT);
+    const kSpurY = lerp(0.82, kOut, spCurveT);
     nNodes.push({
       type: 'cubic',
       c1x: xL,
-      c1y: lerp(leftTopY, topY, kOut),
-      c2x: lerp(archCx, xL, kOut),
+      c1y: lerp(outTurnY, topY, kSpurY),
+      c2x: archCx - (archCx - xL) * kSpurX,
       c2y: topY,
       x: archCx,
       y: topY,
@@ -1510,39 +1673,39 @@ function buildArchGlyph(pc, m, mode) {
   nNodes.push(
     {
       type: 'cubic',
-      c1x: lerp(archCx, xR, kOut),
+      c1x: archCx + (xR - archCx) * kOut,
       c1y: topY,
       c2x: xR,
-      c2y: lerp(m.xh - archDrop, topY, kOut),
+      c2y: lerp(outTurnY, topY, kOut),
       x: xR,
-      y: m.xh - archDrop,
+      y: outTurnY,
     },
     { type: 'pt', x: xR, y: 0, r: 1 },
     { type: 'pt', x: xR - V, y: 0, r: 1 },
-    { type: 'pt', x: xR - V, y: m.xh - archDrop - H * 0.35, r: 0 },
+    { type: 'pt', x: xR - V, y: inTurnY, r: 0 },
     {
       type: 'cubic',
       c1x: xR - V,
-      c1y: lerp(m.xh - archDrop - H * 0.35, inTop, kIn),
-      c2x: lerp(inCx, xR - V, kIn),
+      c1y: lerp(inTurnY, inTop, kIn) - stressDy,
+      c2x: lerp(inCx + stressDx, xR - V, kIn),
       c2y: inTop,
-      x: inCx,
+      x: inCx + stressDx,
       y: inTop,
     },
     {
       type: 'cubic',
-      c1x: lerp(inCx, xL + V, kIn),
+      c1x: lerp(inCx + stressDx, xL + V, kIn),
       c1y: inTop,
       c2x: xL + V,
-      c2y: lerp(m.xh - archDrop - H * 0.35, inTop, kIn),
+      c2y: lerp(inTurnY, inTop, kIn) + stressDy,
       x: xL + V,
-      y: m.xh - archDrop - H * 0.35,
+      y: inTurnY,
     },
     { type: 'pt', x: xL + V, y: 0, r: 1 }
   );
 
   if (isU) {
-    // 180-degree rotation around (adv/2, m.xh/2) preserves CW winding!
+    // 180-degree rotation around (adv/2, m.xh/2) preserves CW winding and global stress angle!
     const rotX = (x) => adv - x;
     const rotY = (y) => m.xh - y;
     const uNodes = nNodes.map((nd) =>
@@ -1705,34 +1868,37 @@ const GLYPH_BUILDERS = {
     pc.addMixedContour(outer, 1);
 
     // Upper D-counter (CCW)
+    const sBias = m.stressBias || 0;
     const inL = xL + V;
     const upTop = cap - H;
     const upBot = waistY + H * 0.46;
     const upInR = Math.max(inL + 22, upR - V * 0.94);
     const upInFlat = lerp(inL, upInR, 0.42);
     const upInMidY = (upTop + upBot) * 0.5;
+    const upShiftY = -sBias * Math.min((upTop - upBot) * 0.22, H * 0.38);
+    const upShiftX = sBias * Math.min((upInR - upInFlat) * 0.25, V * 0.28);
     if (upTop - upBot > 14 && upInR - inL > 14) {
       pc.addMixedContour(
         [
           { type: 'pt', x: inL, y: upTop, r: 0.4, trap: { d: 0.65, w: 0.6, bx: -0.7, by: 0.7 } },
           { type: 'pt', x: inL, y: upBot, r: 0.4, trap: { d: 0.65, w: 0.6, bx: -0.7, by: -0.7 } },
-          { type: 'pt', x: upInFlat, y: upBot, r: 0 },
+          { type: 'pt', x: upInFlat - upShiftX, y: upBot, r: 0 },
           {
             type: 'cubic',
-            c1x: lerp(upInFlat, upInR, kIn),
+            c1x: lerp(upInFlat - upShiftX, upInR, kIn),
             c1y: upBot,
             c2x: upInR,
-            c2y: lerp(upInMidY, upBot, kIn),
+            c2y: lerp(upInMidY + upShiftY, upBot, kIn),
             x: upInR,
-            y: upInMidY,
+            y: upInMidY + upShiftY,
           },
           {
             type: 'cubic',
             c1x: upInR,
-            c1y: lerp(upInMidY, upTop, kIn),
-            c2x: lerp(upInFlat, upInR, kIn),
+            c1y: lerp(upInMidY + upShiftY, upTop, kIn),
+            c2x: lerp(upInFlat + upShiftX, upInR, kIn),
             c2y: upTop,
-            x: upInFlat,
+            x: upInFlat + upShiftX,
             y: upTop,
           },
         ],
@@ -1746,28 +1912,30 @@ const GLYPH_BUILDERS = {
     const loInR = Math.max(inL + 24, loR - V * 0.94);
     const loInFlat = lerp(inL, loInR, 0.44);
     const loInMidY = (loTop + loBot) * 0.5;
+    const loShiftY = -sBias * Math.min((loTop - loBot) * 0.22, H * 0.38);
+    const loShiftX = sBias * Math.min((loInR - loInFlat) * 0.25, V * 0.28);
     if (loTop - loBot > 14 && loInR - inL > 14) {
       pc.addMixedContour(
         [
           { type: 'pt', x: inL, y: loTop, r: 0.4, trap: { d: 0.65, w: 0.6, bx: -0.7, by: 0.7 } },
           { type: 'pt', x: inL, y: loBot, r: 0.4, trap: { d: 0.65, w: 0.6, bx: -0.7, by: -0.7 } },
-          { type: 'pt', x: loInFlat, y: loBot, r: 0 },
+          { type: 'pt', x: loInFlat - loShiftX, y: loBot, r: 0 },
           {
             type: 'cubic',
-            c1x: lerp(loInFlat, loInR, kIn),
+            c1x: lerp(loInFlat - loShiftX, loInR, kIn),
             c1y: loBot,
             c2x: loInR,
-            c2y: lerp(loInMidY, loBot, kIn),
+            c2y: lerp(loInMidY + loShiftY, loBot, kIn),
             x: loInR,
-            y: loInMidY,
+            y: loInMidY + loShiftY,
           },
           {
             type: 'cubic',
             c1x: loInR,
-            c1y: lerp(loInMidY, loTop, kIn),
-            c2x: lerp(loInFlat, loInR, kIn),
+            c1y: lerp(loInMidY + loShiftY, loTop, kIn),
+            c2x: lerp(loInFlat + loShiftX, loInR, kIn),
             c2y: loTop,
-            x: loInFlat,
+            x: loInFlat + loShiftX,
             y: loTop,
           },
         ],
@@ -1844,33 +2012,36 @@ const GLYPH_BUILDERS = {
     );
 
     // Inner CCW D-counter
+    const sBias = m.stressBias || 0;
     const inL = xL + V;
     const inR = Math.max(inL + 26, xR - V);
     const inTop = cap - H;
     const inBot = H;
     const inFlat = lerp(inL, inR, 0.36);
+    const dShiftY = -sBias * Math.min((inTop - inBot) * 0.20, H * 0.45);
+    const dShiftX = sBias * Math.min((inR - inFlat) * 0.25, V * 0.32);
     if (inTop - inBot > 20 && inR - inL > 20) {
       pc.addMixedContour(
         [
           { type: 'pt', x: inL, y: inTop, r: 0.45, trap: { d: 0.85, w: 0.75, bx: -0.7, by: 0.7 } },
           { type: 'pt', x: inL, y: inBot, r: 0.45, trap: { d: 0.85, w: 0.75, bx: -0.7, by: -0.7 } },
-          { type: 'pt', x: inFlat, y: inBot, r: 0 },
+          { type: 'pt', x: inFlat - dShiftX, y: inBot, r: 0 },
           {
             type: 'cubic',
-            c1x: lerp(inFlat, inR, kIn),
+            c1x: lerp(inFlat - dShiftX, inR, kIn),
             c1y: inBot,
             c2x: inR,
-            c2y: lerp(midY, inBot, kIn),
+            c2y: lerp(midY + dShiftY, inBot, kIn),
             x: inR,
-            y: midY,
+            y: midY + dShiftY,
           },
           {
             type: 'cubic',
             c1x: inR,
-            c1y: lerp(midY, inTop, kIn),
-            c2x: lerp(inFlat, inR, kIn),
+            c1y: lerp(midY + dShiftY, inTop, kIn),
+            c2x: lerp(inFlat + dShiftX, inR, kIn),
             c2y: inTop,
-            x: inFlat,
+            x: inFlat + dShiftX,
             y: inTop,
           },
         ],
@@ -1972,40 +2143,43 @@ const GLYPH_BUILDERS = {
         const xR = cx + rx;
         const notchDepth = lerp(m.cap * 0.12, m.cap * 0.22, m.inkTraps * m.trapDepth) * (1 - sp);
 
-        if (sp < 0.95) {
-          // Grotesque G with bottom-right spur or notch
+        if (sp < 0.35) {
+          // Grotesque G with bottom-right spur (sp 0..0.35)
+          const spLocal = sp / 0.35;
           const spurL = xR - V * 0.88;
+          const notchY = -m.ov + notchDepth * (1 - spLocal * 0.75);
           nodes.push(
             {
               type: 'cubic',
               c1x: cx + kxOut * 0.65,
               c1y: cy - ry,
               c2x: spurL - rx * 0.1,
-              c2y: -m.ov + notchDepth * 0.35,
+              c2y: notchY * 0.35,
               x: spurL,
-              y: -m.ov + notchDepth,
+              y: notchY,
             },
             ...(m.inkTraps > 0.02
               ? [
                   {
                     type: 'pt',
-                    x: spurL + V * 0.22 * m.inkTraps * m.trapDepth,
-                    y: -m.ov + notchDepth + V * 0.14 * m.inkTraps * m.trapDepth,
+                    x: spurL + V * 0.22 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                    y: notchY + V * 0.14 * m.inkTraps * m.trapDepth * (1 - spLocal),
                     r: 0,
                   },
                 ]
               : []),
-            { type: 'pt', x: spurL, y: 0, r: 0.8 },
-            { type: 'pt', x: xR, y: 0, r: 0.8 }
+            { type: 'pt', x: spurL, y: 0, r: 0.8 * (1 - spLocal) },
+            { type: 'pt', x: xR, y: 0, r: 0.8 * (1 - spLocal) }
           );
         } else {
-          // Spurless G: continuous outer curve up to barTopY
+          // Spurless G (sp 0.35..1.0): continuous outer curve up to barTopY
+          const spCurveT = clamp((sp - 0.35) / 0.65, 0, 1);
           nodes.push({
             type: 'cubic',
-            c1x: cx + kxOut,
+            c1x: cx + kxOut * lerp(1.18, 1.0, spCurveT),
             c1y: cy - ry,
             c2x: xR,
-            c2y: cy - kyOut,
+            c2y: cy - kyOut * lerp(1.22, 1.0, spCurveT),
             x: xR,
             y: Math.min(cy, barTopY),
           });
@@ -2022,48 +2196,62 @@ const GLYPH_BUILDERS = {
             y: barBotY,
             r: 0.35,
             trap: { d: 0.7, w: 0.65, bx: 0.7, by: 0.7 },
-          },
-          // Inner bottom curve
-          {
-            type: 'cubic',
-            c1x: cx + ix,
-            c1y: lerp(barBotY, cy - iy, 0.58),
-            c2x: cx + kxIn,
-            c2y: cy - iy,
-            x: cx,
-            y: cy - iy,
-          },
-          // Inner left wall
-          {
-            type: 'cubic',
-            c1x: cx - kxIn,
-            c1y: cy - iy,
-            c2x: cx - ix,
-            c2y: cy - kyIn,
-            x: cx - ix,
-            y: cy,
-          },
-          // Inner top crown
-          {
-            type: 'cubic',
-            c1x: cx - ix,
-            c1y: cy + kyIn,
-            c2x: cx - kxIn,
-            c2y: cy + iy,
-            x: cx,
-            y: cy + iy,
-          },
-          // Inner top-right terminal
-          {
-            type: 'cubic',
-            c1x: cx + kxIn * topFrac,
-            c1y: cy + iy,
-            c2x: inTopX - kxIn * Math.sin(topA) * topFrac * 0.65,
-            c2y: lerp(inTopY, cy + iy, 0.62),
-            x: inTopX,
-            y: inTopY,
           }
         );
+
+        const innerG = pc.applyCounterStress(
+          [
+            // Inner bottom curve
+            {
+              type: 'cubic',
+              c1x: cx + ix,
+              c1y: lerp(barBotY, cy - iy, 0.58),
+              c2x: cx + kxIn,
+              c2y: cy - iy,
+              x: cx,
+              y: cy - iy,
+            },
+            // Inner left wall
+            {
+              type: 'cubic',
+              c1x: cx - kxIn,
+              c1y: cy - iy,
+              c2x: cx - ix,
+              c2y: cy - kyIn,
+              x: cx - ix,
+              y: cy,
+            },
+            // Inner top crown
+            {
+              type: 'cubic',
+              c1x: cx - ix,
+              c1y: cy + kyIn,
+              c2x: cx - kxIn,
+              c2y: cy + iy,
+              x: cx,
+              y: cy + iy,
+            },
+            // Inner top-right terminal
+            {
+              type: 'cubic',
+              c1x: cx + kxIn * topFrac,
+              c1y: cy + iy,
+              c2x: inTopX - kxIn * Math.sin(topA) * topFrac * 0.65,
+              c2y: lerp(inTopY, cy + iy, 0.62),
+              x: inTopX,
+              y: inTopY,
+            },
+          ],
+          cx,
+          cy,
+          ix,
+          iy,
+          Math.min(ix * 0.36, V * 0.44),
+          Math.min(iy * 0.36, H * 0.48)
+        );
+        innerG[innerG.length - 1].x = inTopX;
+        innerG[innerG.length - 1].y = inTopY;
+        nodes.push(...innerG);
       },
     });
     return adv;
@@ -2351,34 +2539,37 @@ const GLYPH_BUILDERS = {
       { type: 'pt', x: xL + V, y: 0, r: 1, flare: 1 },
     ]);
 
+    const sBias = m.stressBias || 0;
     const inL = xL + V;
     const inR = Math.max(inL + 22, xR - V * 0.96);
     const inTop = cap - H;
     const inBot = bowlBotY + H * 0.92;
     const inFlat = lerp(inL, inR, 0.38);
     const inMidY = (inTop + inBot) * 0.5;
+    const pShiftY = -sBias * Math.min((inTop - inBot) * 0.22, H * 0.42);
+    const pShiftX = sBias * Math.min((inR - inFlat) * 0.25, V * 0.30);
     if (inTop - inBot > 14 && inR - inL > 14) {
       pc.addMixedContour(
         [
           { type: 'pt', x: inL, y: inTop, r: 0.4, trap: { d: 0.7, w: 0.65, bx: -0.7, by: 0.7 } },
           { type: 'pt', x: inL, y: inBot, r: 0.4, trap: { d: 0.7, w: 0.65, bx: -0.7, by: -0.7 } },
-          { type: 'pt', x: inFlat, y: inBot, r: 0 },
+          { type: 'pt', x: inFlat - pShiftX, y: inBot, r: 0 },
           {
             type: 'cubic',
-            c1x: lerp(inFlat, inR, kIn),
+            c1x: lerp(inFlat - pShiftX, inR, kIn),
             c1y: inBot,
             c2x: inR,
-            c2y: lerp(inMidY, inBot, kIn),
+            c2y: lerp(inMidY + pShiftY, inBot, kIn),
             x: inR,
-            y: inMidY,
+            y: inMidY + pShiftY,
           },
           {
             type: 'cubic',
             c1x: inR,
-            c1y: lerp(inMidY, inTop, kIn),
-            c2x: lerp(inFlat, inR, kIn),
+            c1y: lerp(inMidY + pShiftY, inTop, kIn),
+            c2x: lerp(inFlat + pShiftX, inR, kIn),
             c2y: inTop,
-            x: inFlat,
+            x: inFlat + pShiftX,
             y: inTop,
           },
         ],
@@ -2543,34 +2734,37 @@ const GLYPH_BUILDERS = {
     ]);
 
     // Inner CCW D-counter
+    const sBias = m.stressBias || 0;
     const inL = xL + V;
     const inR = Math.max(inL + 22, bowlR - V * 0.94);
     const inTop = cap - H;
     const inBot = bowlBotY + H * 0.92;
     const inFlat = lerp(inL, inR, 0.38);
     const inMidY = (inTop + inBot) * 0.5;
+    const rShiftY = -sBias * Math.min((inTop - inBot) * 0.22, H * 0.42);
+    const rShiftX = sBias * Math.min((inR - inFlat) * 0.25, V * 0.30);
     if (inTop - inBot > 14 && inR - inL > 14) {
       pc.addMixedContour(
         [
           { type: 'pt', x: inL, y: inTop, r: 0.4, trap: { d: 0.7, w: 0.65, bx: -0.7, by: 0.7 } },
           { type: 'pt', x: inL, y: inBot, r: 0.4, trap: { d: 0.7, w: 0.65, bx: -0.7, by: -0.7 } },
-          { type: 'pt', x: inFlat, y: inBot, r: 0 },
+          { type: 'pt', x: inFlat - rShiftX, y: inBot, r: 0 },
           {
             type: 'cubic',
-            c1x: lerp(inFlat, inR, kIn),
+            c1x: lerp(inFlat - rShiftX, inR, kIn),
             c1y: inBot,
             c2x: inR,
-            c2y: lerp(inMidY, inBot, kIn),
+            c2y: lerp(inMidY + rShiftY, inBot, kIn),
             x: inR,
-            y: inMidY,
+            y: inMidY + rShiftY,
           },
           {
             type: 'cubic',
             c1x: inR,
-            c1y: lerp(inMidY, inTop, kIn),
-            c2x: lerp(inFlat, inR, kIn),
+            c1y: lerp(inMidY + rShiftY, inTop, kIn),
+            c2x: lerp(inFlat + rShiftX, inR, kIn),
             c2y: inTop,
-            x: inFlat,
+            x: inFlat + rShiftX,
             y: inTop,
           },
         ],
@@ -2872,9 +3066,14 @@ Object.assign(GLYPH_BUILDERS, {
 
     const bellyTopY = clamp(xh * (0.57 + m.crossbarShift * 0.14), H * 2.1, xh - H * 1.35);
     const bellyMidY = (bellyTopY + botY) * 0.48;
-    const bellyBotX = xL + (xR - V - xL) * 0.48;
-    const notchDepth = lerp(Math.min(xh * 0.14, V * 0.48), xh * 0.25, m.inkTraps * m.trapDepth) * (1 - sp);
-    const rightBotCornerY = lerp(0, xh * 0.36, sp);
+    const bellyBotX = lerp(xL + (xR - V - xL) * 0.48, (xL + xR) * 0.5, sp);
+    const rightSpan = Math.max(12, xR - V - bellyBotX);
+    const notchBase = Math.min(
+      lerp(Math.min(xh * 0.075, V * 0.24), xh * 0.22, m.inkTraps * m.trapDepth),
+      rightSpan * 0.38
+    );
+    const spCurveT = clamp((sp - 0.35) / 0.65, 0, 1);
+    const rightBotCornerY = sp < 0.35 ? 0 : bellyMidY;
 
     // Outer CW contour of double-story 'a'
     const outer = [
@@ -2901,40 +3100,44 @@ Object.assign(GLYPH_BUILDERS, {
         y: xh * 0.58,
       },
       // Down right stem to rightBotCornerY
-      { type: 'pt', x: xR, y: rightBotCornerY, r: sp > 0.5 ? 0 : 1 },
+      { type: 'pt', x: xR, y: rightBotCornerY, r: sp < 0.35 ? 1 - sp * 2.5 : 0 },
     ];
 
-    if (sp < 0.98) {
+    if (sp < 0.35) {
+      const spLocal = sp / 0.35;
+      const notch = notchBase * (1 - spLocal * 0.75);
       outer.push(
-        { type: 'pt', x: xR - V * (1 - sp), y: rightBotCornerY * 0.15, r: 0.8 },
-        { type: 'pt', x: xR - V, y: botY + notchDepth, r: 0.15 },
-        ...(m.inkTraps > 0.02 && sp < 0.75
+        { type: 'pt', x: xR - V, y: 0, r: 0.9 * (1 - spLocal) },
+        { type: 'pt', x: xR - V, y: botY + notch, r: 0.15 },
+        ...(m.inkTraps > 0.02
           ? [
               {
                 type: 'pt',
-                x: xR - V + V * 0.25 * m.inkTraps * m.trapDepth * (1 - sp),
-                y: botY + notchDepth + V * 0.12 * m.inkTraps * m.trapDepth * (1 - sp),
+                x: xR - V + V * 0.25 * m.inkTraps * m.trapDepth * (1 - spLocal),
+                y: botY + notch + V * 0.12 * m.inkTraps * m.trapDepth * (1 - spLocal),
                 r: 0,
               },
             ]
           : []),
         {
           type: 'cubic',
-          c1x: lerp(xR - V, bellyBotX, 0.28),
-          c1y: lerp(botY + notchDepth, botY, 0.78),
-          c2x: lerp(bellyBotX, xR - V, kOut),
+          c1x: xR - V - rightSpan * 0.24,
+          c1y: lerp(botY + notch, botY, 0.76),
+          c2x: bellyBotX + rightSpan * kOut,
           c2y: botY,
           x: bellyBotX,
           y: botY,
         }
       );
     } else {
-      // Spurless bottom-right sweep
+      // Spurless bottom-right sweep (zero stair-step ledges)
+      const kSpurX = lerp(0.76, kOut, spCurveT);
+      const kSpurY = lerp(0.82, kOut, spCurveT);
       outer.push({
         type: 'cubic',
         c1x: xR,
-        c1y: lerp(rightBotCornerY, botY, kOut),
-        c2x: lerp(bellyBotX, xR, kOut),
+        c1y: lerp(bellyMidY, botY, kSpurY),
+        c2x: lerp(bellyBotX, xR, kSpurX),
         c2y: botY,
         x: bellyBotX,
         y: botY,
@@ -2992,37 +3195,40 @@ Object.assign(GLYPH_BUILDERS, {
     const inBot = botY + H * 0.90;
     const inMidY = (inTop + inBot) * 0.5;
     const inCx = (inL + inR) * 0.48;
+    const sBias = m.stressBias || 0;
+    const aShiftX = sBias * Math.min((inR - inL) * 0.18, V * 0.28);
+    const aShiftY = sBias * Math.min((inTop - inBot) * 0.18, H * 0.30);
     if (inR - inL > 14 && inTop - inBot > 12) {
       pc.addMixedContour(
         [
-          { type: 'pt', x: inL, y: inMidY, r: 0 },
+          { type: 'pt', x: inL, y: inMidY + aShiftY, r: 0 },
           {
             type: 'cubic',
             c1x: inL,
-            c1y: lerp(inMidY, inBot, kIn),
-            c2x: lerp(inCx, inL, kIn),
+            c1y: lerp(inMidY + aShiftY, inBot, kIn),
+            c2x: lerp(inCx - aShiftX, inL, kIn),
             c2y: inBot,
-            x: inCx,
+            x: inCx - aShiftX,
             y: inBot,
           },
           {
             type: 'cubic',
-            c1x: lerp(inCx, inR, kIn),
+            c1x: lerp(inCx - aShiftX, inR, kIn),
             c1y: inBot,
             c2x: inR,
-            c2y: lerp(inMidY, inBot, kIn),
+            c2y: lerp(inMidY - aShiftY, inBot, kIn),
             x: inR,
-            y: inMidY,
+            y: inMidY - aShiftY,
           },
           { type: 'pt', x: inR, y: inTop, r: 0.35, trap: { d: 0.65, w: 0.6, bx: 0.7, by: 0.7 } },
           {
             type: 'cubic',
-            c1x: lerp(inCx, inR, 0.55),
+            c1x: lerp(inCx + aShiftX, inR, 0.55),
             c1y: inTop,
             c2x: inL,
-            c2y: lerp(inMidY, inTop, kIn),
+            c2y: lerp(inMidY + aShiftY, inTop, kIn),
             x: inL,
-            y: inMidY,
+            y: inMidY + aShiftY,
           },
         ],
         -1
@@ -3091,6 +3297,10 @@ Object.assign(GLYPH_BUILDERS, {
     const inBotX = cx + ix * Math.cos(asinClamp((cy - inBotY) / iy));
     const botFrac = clamp((Math.PI / 2 - botA) / (Math.PI / 2), 0.2, 1);
 
+    const sBias = m.stressBias || 0;
+    const eShiftX = sBias * Math.min(ix * 0.35, V * 0.40);
+    const eShiftY = sBias * Math.min(iy * 0.28, H * 0.36);
+
     // Outer CW contour
     pc.addMixedContour(
       [
@@ -3137,17 +3347,17 @@ Object.assign(GLYPH_BUILDERS, {
           type: 'cubic',
           c1x: inBotX - ix * Math.sin(botA) * kIn * botFrac * 0.65,
           c1y: lerp(inBotY, cy - iy, 0.62),
-          c2x: cx + ix * kIn * botFrac,
+          c2x: cx - eShiftX + ix * kIn * botFrac,
           c2y: cy - iy,
-          x: cx,
+          x: cx - eShiftX,
           y: cy - iy,
         },
         {
           type: 'cubic',
-          c1x: cx - ix * kIn,
+          c1x: cx - eShiftX - ix * kIn,
           c1y: cy - iy,
           c2x: cx - ix,
-          c2y: lerp(barBotY, cy - iy, 0.55),
+          c2y: lerp(barBotY, cy - iy, 0.55) + eShiftY,
           x: cx - ix,
           y: barBotY,
         },
@@ -3166,18 +3376,18 @@ Object.assign(GLYPH_BUILDERS, {
           {
             type: 'cubic',
             c1x: cx + ix,
-            c1y: lerp(barTopY, eyeTop, kIn),
-            c2x: cx + ix * kIn,
+            c1y: lerp(barTopY, eyeTop, kIn) - eShiftY * 0.5,
+            c2x: cx + eShiftX * 0.7 + ix * kIn,
             c2y: eyeTop,
-            x: cx,
+            x: cx + eShiftX * 0.7,
             y: eyeTop,
           },
           {
             type: 'cubic',
-            c1x: cx - ix * kIn,
+            c1x: cx + eShiftX * 0.7 - ix * kIn,
             c1y: eyeTop,
             c2x: cx - ix,
-            c2y: lerp(barTopY, eyeTop, kIn),
+            c2y: lerp(barTopY, eyeTop, kIn) + eShiftY * 0.5,
             x: cx - ix,
             y: barTopY,
           },
@@ -3259,13 +3469,22 @@ Object.assign(GLYPH_BUILDERS, {
     const kOut = m.kappaOut;
     const kIn = m.kappaIn;
 
-    const bowlCenterX = xR - V - (w - V) * lerp(0.45, 0.49, sp);
-    const bowlRx = bowlCenterX - xL;
+    const cx = (xL + xR) * 0.5;
+    const bowlCenterX = lerp(cx - V * 0.06, cx, sp);
+    const bowlRxLeft = bowlCenterX - xL;
     const bowlRy = (topY - bowlBotY) * 0.5;
-    const notchDepth = lerp(Math.min(xh * 0.15, V * 0.52), xh * 0.28, m.inkTraps * m.trapDepth);
-    const topNotch = notchDepth * (1 - sp);
-    const botNotch = notchDepth;
-    const rightTopCornerY = lerp(xh, bowlMidY, sp);
+    const botRightSpan = Math.max(12, xR - V - bowlCenterX);
+    const baseNotch = lerp(Math.min(xh * 0.075, V * 0.24), Math.min(xh * 0.02, V * 0.06), sp);
+    const trapNotch = xh * 0.22 * m.inkTraps * m.trapDepth;
+    const botNotch = Math.min(baseNotch + trapNotch, botRightSpan * 0.36);
+    const botCrownX = lerp(xR - V - botRightSpan * 0.55, bowlCenterX, 0.35);
+    const botStemSpan = Math.max(10, xR - V - botCrownX);
+    const botRxLeft = botCrownX - xL;
+
+    // Two-stage spurless transition at top-right of 'g'
+    const topNotch = Math.min(baseNotch + trapNotch, botRightSpan * 0.38) * Math.max(0, 1 - sp / 0.35);
+    const spurCurveStartY = lerp(topY - H * 0.45, bowlMidY, clamp((sp - 0.35) / 0.65, 0, 1));
+    const spurTopY = sp < 0.35 ? xh : spurCurveStartY;
 
     const descBotY = m.desc - m.ov;
     const descTurnY = m.desc + H * 1.25;
@@ -3274,7 +3493,7 @@ Object.assign(GLYPH_BUILDERS, {
 
     // Outer CW contour
     const outer = [
-      { type: 'pt', x: xR, y: rightTopCornerY, r: sp > 0.5 ? 0 : 1 },
+      { type: 'pt', x: xR, y: spurTopY, r: sp < 0.35 ? 1 : 0 },
       { type: 'pt', x: xR, y: descTurnY, r: 0 },
       // Descender hook bottom curve
       {
@@ -3326,20 +3545,20 @@ Object.assign(GLYPH_BUILDERS, {
             },
           ]
         : []),
-      // Bottom bowl crown
+      // Bottom bowl crown (uses botStemSpan so c2x never overshoots into right stem!)
       {
         type: 'cubic',
-        c1x: lerp(xR - V, bowlCenterX, 0.25),
-        c1y: lerp(bowlBotY + botNotch, bowlBotY, 0.78),
-        c2x: bowlCenterX + bowlRx * kOut * 0.85,
+        c1x: xR - V - botStemSpan * 0.22,
+        c1y: lerp(bowlBotY + botNotch, bowlBotY, 0.80),
+        c2x: botCrownX + botStemSpan * kOut,
         c2y: bowlBotY,
-        x: bowlCenterX,
+        x: botCrownX,
         y: bowlBotY,
       },
       // Left bowl cheek
       {
         type: 'cubic',
-        c1x: bowlCenterX - bowlRx * kOut,
+        c1x: botCrownX - botRxLeft * kOut,
         c1y: bowlBotY,
         c2x: xL,
         c2y: bowlMidY - bowlRy * kOut,
@@ -3351,48 +3570,51 @@ Object.assign(GLYPH_BUILDERS, {
         type: 'cubic',
         c1x: xL,
         c1y: bowlMidY + bowlRy * kOut,
-        c2x: bowlCenterX - bowlRx * kOut,
+        c2x: bowlCenterX - bowlRxLeft * kOut,
         c2y: topY,
         x: bowlCenterX,
         y: topY,
       },
     ];
 
-    if (sp < 0.98) {
+    if (sp < 0.35) {
+      const topRightSpan = Math.max(12, xR - V - bowlCenterX);
       outer.push(
         {
           type: 'cubic',
-          c1x: bowlCenterX + bowlRx * kOut * 0.85,
+          c1x: bowlCenterX + topRightSpan * kOut,
           c1y: topY,
-          c2x: lerp(xR - V, bowlCenterX, 0.25),
-          c2y: lerp(topY - topNotch, topY, 0.78),
+          c2x: xR - V - topRightSpan * 0.22,
+          c2y: lerp(topY - topNotch, topY, 0.72),
           x: xR - V,
           y: topY - topNotch,
         },
-        ...(m.inkTraps > 0.02 && sp < 0.75
+        ...(m.inkTraps > 0.02
           ? [
               {
                 type: 'pt',
-                x: xR - V + V * 0.26 * m.inkTraps * m.trapDepth * (1 - sp),
-                y: topY - topNotch - V * 0.12 * m.inkTraps * m.trapDepth * (1 - sp),
+                x: xR - V + V * 0.26 * m.inkTraps * m.trapDepth * (1 - sp / 0.35),
+                y: topY - topNotch - V * 0.12 * m.inkTraps * m.trapDepth * (1 - sp / 0.35),
                 r: 0,
               },
             ]
           : []),
-        { type: 'pt', x: xR - V, y: lerp(xh, rightTopCornerY, sp), r: 0.8 },
-        { type: 'pt', x: xR - V * sp, y: lerp(xh, rightTopCornerY, sp), r: 0.8 }
+        { type: 'pt', x: xR - V, y: xh, r: 0.8 }
       );
     } else {
-      // Spurless top-right sweep
-      const fullRx = xR - bowlCenterX;
+      // Continuous spurless top-right sweep
+      const spT = clamp((sp - 0.35) / 0.65, 0, 1);
+      const kSpurX = lerp(0.76, kOut, spT);
+      const kSpurY = lerp(0.68, kOut, spT);
+      const fullRxRight = xR - bowlCenterX;
       outer.push({
         type: 'cubic',
-        c1x: bowlCenterX + fullRx * kOut,
+        c1x: bowlCenterX + fullRxRight * kSpurX,
         c1y: topY,
         c2x: xR,
-        c2y: bowlMidY + bowlRy * kOut,
+        c2y: lerp(spurCurveStartY, topY, kSpurY),
         x: xR,
-        y: rightTopCornerY,
+        y: spurCurveStartY,
       });
     }
 
@@ -5382,29 +5604,67 @@ Object.assign(GLYPH_BUILDERS, {
   },
 
   'Æ'(pc, m) {
-    const advA = GLYPH_BUILDERS.A(pc, { ...m, widthScale: m.widthScale * 0.82 });
-    const eShift = Math.round(advA * 0.68);
-    const tmp = new PathCompiler(m);
-    const advE = GLYPH_BUILDERS.E(tmp, { ...m, widthScale: m.widthScale * 0.84 });
-    for (const c of tmp.contours) {
-      pc.contours.push(
-        c.map((seg) =>
-          seg.cmd === 'C'
-            ? { ...seg, c1x: seg.c1x + eShift, c2x: seg.c2x + eShift, x: seg.x + eShift }
-            : seg.cmd === 'Z'
-            ? seg
-            : { ...seg, x: seg.x + eShift }
-        )
+    const w = Math.round(860 * m.widthScale);
+    const sb = Math.round(40 * clamp(m.widthScale, 0.75, 1.15));
+    const adv = w + sb * 2;
+    const xL = sb;
+    const xR = sb + w;
+    const cap = m.cap;
+    const V = Math.min(m.V * 0.94, w * 0.22);
+    const H = Math.min(m.H * 0.90, cap * 0.19);
+    const D = Math.min(m.D1 * 0.94, V * 1.02);
+    const stemX = xL + Math.round(w * 0.48); // Shared central vertical stem between A and E
+    const barA = clamp(cap * (0.32 + m.crossbarShift * 0.14), H * 1.1, cap * 0.56);
+    const midE = clamp(cap * (0.50 + m.crossbarShift * 0.12), H * 1.6, cap - H * 1.6);
+    const midR = xR - w * 0.05;
+
+    const slope = (stemX - xL) / cap;
+    const barInL = xL + D * 1.04 + (barA + H * 0.92) * slope;
+    const legInL = xL + D * 1.04 + barA * slope;
+
+    // Outer CW contour of unified Æ
+    pc.addPolygon([
+      [xL, 0, { r: 1, flare: 1 }],
+      [stemX - V * 0.15, cap, { r: 1 }],
+      [xR, cap, { r: 1 }],
+      [xR, cap - H, { r: 1 }],
+      [stemX + V, cap - H, { r: 0.35, trap: { d: 0.75, w: 0.7, bx: 0.7, by: -0.7 } }],
+      [stemX + V, midE + H * 0.46, { r: 0.35, trap: { d: 0.75, w: 0.7, bx: 0.7, by: 0.7 } }],
+      [midR, midE + H * 0.46, { r: 1 }],
+      [midR, midE - H * 0.46, { r: 1 }],
+      [stemX + V, midE - H * 0.46, { r: 0.35, trap: { d: 0.75, w: 0.7, bx: 0.7, by: -0.7 } }],
+      [stemX + V, H, { r: 0.35, trap: { d: 0.75, w: 0.7, bx: 0.7, by: 0.7 } }],
+      [xR, H, { r: 1 }],
+      [xR, 0, { r: 1 }],
+      [stemX, 0, { r: 1 }],
+      [stemX, barA, { r: 0.35 }],
+      [legInL, barA, { r: 0.35 }],
+      [xL + D * 1.04, 0, { r: 1, flare: 1 }],
+    ]);
+
+    // Inner CCW triangle counter of A half
+    const apexY = Math.max(barA + H * 1.25, cap - H * 1.25);
+    if (stemX - barInL > 14 && apexY - (barA + H * 0.92) > 14) {
+      pc.addPolygon(
+        [
+          [barInL, barA + H * 0.92, { r: 0.35 }],
+          [stemX, barA + H * 0.92, { r: 0.35 }],
+          [stemX, apexY, { r: 0.25, trap: { d: 0.85, w: 0.7, bx: -0.4, by: -0.9 } }],
+        ],
+        -1
       );
     }
-    return eShift + advE;
+    return adv;
   },
 
   'æ'(pc, m) {
-    const advA = GLYPH_BUILDERS.a(pc, { ...m, widthScale: m.widthScale * 0.85 });
-    const eShift = Math.round(advA * 0.72);
+    const subM = { ...m, widthScale: m.widthScale * 0.84, spurless: Math.max(m.spurless, 0.45) };
+    const advA = GLYPH_BUILDERS.a(pc, subM);
+    const sbSub = Math.round(44 * clamp(subM.widthScale, 0.75, 1.15));
+    const vSub = Math.min(subM.V * 0.90, 555 * subM.widthScale * 0.37);
+    const eShift = Math.round(advA - sbSub * 2 - vSub * 0.92);
     const tmp = new PathCompiler(m);
-    const advE = GLYPH_BUILDERS.e(tmp, { ...m, widthScale: m.widthScale * 0.88 });
+    const advE = GLYPH_BUILDERS.e(tmp, subM);
     for (const c of tmp.contours) {
       pc.contours.push(
         c.map((seg) =>
